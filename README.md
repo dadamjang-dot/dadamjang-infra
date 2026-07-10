@@ -1,4 +1,4 @@
-# 다담장 Infrastructure
+# Dadamjang Infrastructure
 
 다담장 플랫폼의 로컬 개발 환경, 배포 설정, 관측 구성을 관리합니다.
 
