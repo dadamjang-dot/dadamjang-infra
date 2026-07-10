@@ -1,0 +1,102 @@
+name: staging api deploy
+
+on:
+  repository_dispatch:
+    types: [backend-main]
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: dadamjang-be ref to build and deploy
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BACKEND_REF: ${{ github.event.client_payload.ref || inputs.backend_ref || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dadamjang-dot/dadamjang-be
+          ref: ${{ env.BACKEND_REF }}
+          path: backend
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: backend/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: backend
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        working-directory: backend
+        run: pnpm lint
+      - name: Test
+        working-directory: backend
+        run: pnpm test --runInBand
+      - name: Build
+        working-directory: backend
+        run: pnpm build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    env:
+      AWS_ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER }}
+      AWS_ECS_SERVICE: ${{ vars.AWS_ECS_SERVICE }}
+      AWS_ECS_TASK_FAMILY: ${{ vars.AWS_ECS_TASK_FAMILY }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_API_DEPLOY_ROLE_ARN }}
+      BACKEND_REF: ${{ github.event.client_payload.ref || inputs.backend_ref || 'main' }}
+      ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: infra
+      - uses: actions/checkout@v4
+        with:
+          repository: dadamjang-dot/dadamjang-be
+          ref: ${{ env.BACKEND_REF }}
+          path: backend
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+      - name: Build and push immutable image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --file infra/docker/backend.Dockerfile --tag "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" backend
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      - name: Read active ECS task definition
+        run: aws ecs describe-task-definition --task-definition "$AWS_ECS_TASK_FAMILY" --query taskDefinition > task-definition.json
+      - uses: aws-actions/amazon-ecs-render-task-definition@v1
+        id: task-definition
+        with:
+          task-definition: task-definition.json
+          container-name: api
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-definition.outputs.task-definition }}
+          service: ${{ env.AWS_ECS_SERVICE }}
+          cluster: ${{ env.AWS_ECS_CLUSTER }}
+          wait-for-service-stability: true
+      - name: Start the staging API service
+        run: |
+          aws ecs update-service --cluster "$AWS_ECS_CLUSTER" --service "$AWS_ECS_SERVICE" --desired-count 1 >/dev/null
+          aws ecs wait services-stable --cluster "$AWS_ECS_CLUSTER" --services "$AWS_ECS_SERVICE"

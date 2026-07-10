@@ -1,0 +1,43 @@
+name: staging terraform apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Terraform action to execute after GitHub Environment approval
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+      TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+      - name: Write Terraform backend configuration
+        run: printf '%s' "$TF_BACKEND_CONFIG" > terraform/staging/backend.hcl
+      - name: Initialize Terraform state backend
+        run: terraform -chdir=terraform/staging init -input=false -backend-config=backend.hcl
+      - name: Terraform plan
+        run: terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan
+      - name: Terraform apply
+        if: ${{ inputs.action == 'apply' }}
+        run: terraform -chdir=terraform/staging apply -input=false staging.tfplan
