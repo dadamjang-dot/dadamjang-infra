@@ -78,6 +78,24 @@ ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `20
 
 API deploy role은 ECR push와 ECS task definition/service 갱신만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. Terraform apply workflow은 `staging` Environment 보호 규칙(Required reviewers)을 반드시 설정한 뒤 사용한다.
 
+현재 `staging` Environment variables는 아래 기본 naming으로 등록되어 있다.
+
+```txt
+AWS_REGION=ap-northeast-2
+AWS_ECR_REPOSITORY=dadamjang-staging-api
+AWS_ECS_CLUSTER=dadamjang-staging-cluster
+AWS_ECS_SERVICE=dadamjang-staging-api
+AWS_ECS_TASK_FAMILY=dadamjang-staging-api
+```
+
+아래 secrets는 실제 AWS 계정과 원격 Terraform backend 값이 있어야 등록할 수 있다.
+
+```txt
+AWS_API_DEPLOY_ROLE_ARN
+AWS_TERRAFORM_ROLE_ARN
+TF_BACKEND_CONFIG
+```
+
 ## API runtime secrets
 
 Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terraform 변수나 Git에 넣지 않는다. apply 후 `api_runtime_secret_arn`에 JSON secret을 등록한다.
