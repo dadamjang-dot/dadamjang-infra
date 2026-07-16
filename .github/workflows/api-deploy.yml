@@ -82,6 +82,26 @@ jobs:
         run: |
           docker build --file infra/docker/backend.Dockerfile --tag "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" backend
           docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      - name: Run database migrations
+        env:
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          network_config=$(aws ecs describe-services --cluster "$AWS_ECS_CLUSTER" --service "$AWS_ECS_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
+          subnets=$(echo "$network_config" | jq -r '.subnets | join(",")')
+          security_groups=$(echo "$network_config" | jq -r '.securityGroups | join(",")')
+          task_arn=$(aws ecs run-task \
+            --cluster "$AWS_ECS_CLUSTER" \
+            --task-definition "$AWS_ECS_TASK_FAMILY" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_groups],assignPublicIp=DISABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"api\",\"image\":\"$IMAGE\",\"command\":[\"node\",\"dist/scripts/migrate.js\"]}]}" \
+            --query 'tasks[0].taskArn' --output text)
+          aws ecs wait tasks-stopped --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn"
+          exit_code=$(aws ecs describe-tasks --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$exit_code" != "0" ]; then
+            echo "Migration failed with exit code $exit_code"
+            exit 1
+          fi
       - name: Read active ECS task definition
         run: aws ecs describe-task-definition --task-definition "$AWS_ECS_TASK_FAMILY" --query taskDefinition > task-definition.json
       - uses: aws-actions/amazon-ecs-render-task-definition@v1

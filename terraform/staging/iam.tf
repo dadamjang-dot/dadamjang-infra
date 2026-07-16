@@ -98,7 +98,9 @@ data "aws_iam_policy_document" "github_api_deploy" {
     actions = [
       "ecs:DescribeServices",
       "ecs:DescribeTaskDefinition",
+      "ecs:DescribeTasks",
       "ecs:RegisterTaskDefinition",
+      "ecs:RunTask",
       "ecs:UpdateService",
     ]
     resources = ["*"]
