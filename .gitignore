@@ -1,3 +1,4 @@
+.omo
 .env
 .env.*
 !.env.example
