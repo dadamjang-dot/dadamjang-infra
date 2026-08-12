@@ -1,13 +1,14 @@
 # dadamjang infra
 
-다담장 플랫폼의 로컬 개발 의존성, staging AWS 인프라, CI/CD 설정을 관리한다.
+다담장 플랫폼의 로컬 개발 의존성, staging/e2e AWS 인프라, CI/CD 설정을 관리한다.
 
 ## 구성
 
 - local: PostgreSQL 16, Redis 7, MinIO, Mailpit
 - staging: AWS VPC, ALB, ECS Fargate API, RDS PostgreSQL, ElastiCache Redis, ECR, Secrets Manager, CloudWatch
+- e2e: staging과 분리된 AWS VPC, `dadamjang_e2e` RDS PostgreSQL, Redis, ECS Fargate API, ECR, Secrets Manager, HTTPS ALB
 - image: Cloudflare R2 원본 저장 + Cloudflare Images 변환. AWS S3와 CloudFront는 사용하지 않는다.
-- environment: `staging`만 선언한다. production Terraform root는 만들지 않는다.
+- environment: `staging`과 `e2e`를 별도 Terraform root/state로 선언한다. production Terraform root는 만들지 않는다.
 
 ## 로컬 실행
 
