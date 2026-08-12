@@ -27,8 +27,20 @@ jobs:
       - name: Validate Docker Compose
         run: docker compose --env-file .env.example config --quiet
       - name: Check Terraform formatting
-        run: terraform -chdir=terraform/staging fmt -check -recursive
+        run: terraform fmt -check -recursive terraform
+      - name: Guard e2e isolation and scale-down contract
+        shell: bash
+        run: |
+          test "$(grep -Ec '^[[:space:]]*desired_count[[:space:]]*=[[:space:]]*0$' terraform/e2e/application.tf)" -eq 1
+          ! grep -En 'terraform_remote_state|terraform/staging|staging' terraform/e2e/*.tf
+          ! grep -Ei 'secret|password|valueFrom' terraform/e2e/outputs.tf
+          grep -Fq 'if: always()' terraform/e2e/README.md
+          grep -Fq -- '--desired-count 0' terraform/e2e/README.md
       - name: Initialize Terraform without a state backend
         run: terraform -chdir=terraform/staging init -backend=false -input=false
       - name: Validate Terraform
         run: terraform -chdir=terraform/staging validate
+      - name: Initialize e2e Terraform without a state backend
+        run: terraform -chdir=terraform/e2e init -backend=false -input=false
+      - name: Validate e2e Terraform
+        run: terraform -chdir=terraform/e2e validate
