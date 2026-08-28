@@ -3,6 +3,7 @@ name: infra ci
 on:
   pull_request:
     paths:
+      - ".env.example"
       - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
@@ -15,6 +16,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".env.example"
       - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"

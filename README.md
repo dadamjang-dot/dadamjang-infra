@@ -196,6 +196,8 @@ API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Ima
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 
+`repository_dispatch`의 `client_payload.ref`는 누락이나 mutable fallback 없이 정확한 소문자 40자리 commit SHA여야 한다. 수동 `workflow_dispatch`는 별도의 필수 `backend_ref` 문자열을 사용하며 기본값은 `main`이다.
+
 ```yaml
 # dadamjang-be/.github/workflows/deploy-dispatch.yml에 추가할 계약
 - name: Trigger infrastructure deployment

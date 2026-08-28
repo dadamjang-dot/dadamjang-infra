@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   test:
@@ -35,16 +34,42 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 20
-    env:
-      BACKEND_REF: ${{ github.event.client_payload.ref || inputs.backend_ref || 'main' }}
     steps:
+      - name: Resolve backend ref
+        id: backend-ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY_DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          WORKFLOW_DISPATCH_REF: ${{ inputs.backend_ref }}
+        run: |
+          case "$EVENT_NAME" in
+            repository_dispatch)
+              if [[ ! "$REPOSITORY_DISPATCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
+                printf 'repository_dispatch ref must be a full commit SHA\n' >&2
+                exit 1
+              fi
+              backend_ref="$REPOSITORY_DISPATCH_REF"
+              ;;
+            workflow_dispatch)
+              if [[ ! "$WORKFLOW_DISPATCH_REF" =~ ^[^[:space:]]+$ ]]; then
+                printf 'workflow_dispatch ref must be non-empty and contain no whitespace\n' >&2
+                exit 1
+              fi
+              backend_ref="$WORKFLOW_DISPATCH_REF"
+              ;;
+            *)
+              printf 'unsupported deployment event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          printf 'backend_ref=%s\n' "$backend_ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: infra
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: dadamjang-dot/dadamjang-be
-          ref: ${{ env.BACKEND_REF }}
+          ref: ${{ steps.backend-ref.outputs.backend_ref }}
           path: backend
       - name: Resolve release identity
         id: release
@@ -77,6 +102,9 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     concurrency:
       group: staging-api-deploy
       cancel-in-progress: false

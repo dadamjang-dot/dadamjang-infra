@@ -141,11 +141,69 @@ check.call("local development services use reviewed immutable images") do
 end
 
 check.call("infra CI watches release behavior and documentation") do
-  required_paths = Set.new(["README.md", "scripts/**"])
+  required_paths = Set.new([".env.example", "README.md", "scripts/**"])
   %w[pull_request push].each do |event|
     configured_paths = infra_ci_triggers.fetch(event).fetch("paths").to_set
     missing_paths = required_paths - configured_paths
     assert.call(missing_paths.empty?, "#{event} omits #{missing_paths.to_a.join(", ")}")
+  end
+end
+
+check.call("API workflow scopes OIDC permission to deploy") do
+  assert.call(workflow.fetch("permissions") == { "contents" => "read" }, "workflow-wide permissions can mint OIDC tokens")
+  assert.call(!test_job.fetch("permissions", {}).key?("id-token"), "test job can mint OIDC tokens")
+  assert.call(
+    deploy_job.fetch("permissions") == { "contents" => "read", "id-token" => "write" },
+    "deploy job lacks exact OIDC permissions",
+  )
+end
+
+check.call("API workflow resolves event-specific backend refs") do
+  triggers = workflow["on"] || workflow.fetch(true)
+  manual_input = triggers.fetch("workflow_dispatch").fetch("inputs").fetch("backend_ref")
+  assert.call(manual_input.fetch("required"), "manual backend ref is optional")
+  assert.call(manual_input.fetch("type") == "string", "manual backend ref is not an explicit string")
+  assert.call(manual_input.fetch("default") == "main", "manual backend ref default is not explicit")
+  resolver = step_named.call(test_job, "Resolve backend ref")
+  assert.call(resolver.fetch("id") == "backend-ref", "resolved backend ref is not captured")
+  backend_checkout = test_job.fetch("steps").find do |step|
+    uses_action.call(step, "actions/checkout") && step.dig("with", "repository") == "dadamjang-dot/dadamjang-be"
+  end || raise("missing backend checkout")
+  assert.call(backend_checkout.dig("with", "ref") == "${{ steps.backend-ref.outputs.backend_ref }}", "backend checkout bypasses the validated ref")
+
+  resolve = lambda do |event_name:, repository_ref:, manual_ref:|
+    Dir.mktmpdir("backend-ref") do |directory|
+      github_output = File.join(directory, "github-output")
+      _, error, status = Open3.capture3(
+        {
+          "EVENT_NAME" => event_name,
+          "GITHUB_OUTPUT" => github_output,
+          "REPOSITORY_DISPATCH_REF" => repository_ref,
+          "WORKFLOW_DISPATCH_REF" => manual_ref,
+        },
+        "bash", "-eu", "-c", resolver.fetch("run"),
+        chdir: root,
+      )
+      values = File.exist?(github_output) ? File.readlines(github_output, chomp: true).to_h { |line| line.split("=", 2) } : {}
+      [values["backend_ref"], error, status]
+    end
+  end
+
+  repository_sha = "a" * 40
+  resolved, error, status = resolve.call(event_name: "repository_dispatch", repository_ref: repository_sha, manual_ref: "main")
+  assert.call(status.success?, error)
+  assert.call(resolved == repository_sha, "repository dispatch did not preserve the exact commit")
+  ["", "main", "a" * 39, "g" * 40].each do |invalid_ref|
+    _, _, invalid_status = resolve.call(event_name: "repository_dispatch", repository_ref: invalid_ref, manual_ref: "main")
+    assert.call(!invalid_status.success?, "repository dispatch accepted #{invalid_ref.inspect}")
+  end
+
+  resolved, error, status = resolve.call(event_name: "workflow_dispatch", repository_ref: repository_sha, manual_ref: "release/manual-ref")
+  assert.call(status.success?, error)
+  assert.call(resolved == "release/manual-ref", "manual dispatch did not preserve its explicit ref")
+  ["", "   "].each do |invalid_ref|
+    _, _, invalid_status = resolve.call(event_name: "workflow_dispatch", repository_ref: repository_sha, manual_ref: invalid_ref)
+    assert.call(!invalid_status.success?, "manual dispatch accepted #{invalid_ref.inspect}")
   end
 end
 
