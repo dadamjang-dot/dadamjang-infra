@@ -66,7 +66,7 @@ workspaces {
 }
 ```
 
-staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI는 보호된 `HCP_TERRAFORM_TOKEN`을 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달해 Terraform CLI credentials를 구성한다. 로컬에서는 `terraform login app.terraform.io`로 동일한 credentials를 별도로 구성한다. 토큰은 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI는 staging workspace 작업에 필요한 최소 권한만 부여한 team API token을 보호된 `HCP_TERRAFORM_TOKEN`으로 저장하고 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달해 Terraform CLI credentials를 구성한다. Organization API token과 agent token은 CI 인증에 사용하지 않는다. Team API token에는 가능한 가장 짧은 만료 시간을 설정하고 저장소 운영 담당자가 만료 전 rotation을 책임진다. 로컬의 `terraform login app.terraform.io`는 개발자 개인의 user API token을 별도로 구성한다. 토큰은 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
 첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
@@ -105,7 +105,7 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
-| `HCP_TERRAFORM_TOKEN` | Secret | Terraform CLI에서만 사용하는 HCP Terraform API token |
+| `HCP_TERRAFORM_TOKEN` | Secret | staging workspace 최소 권한으로 제한한 HCP Terraform team API token |
 
 API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform apply와 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
 

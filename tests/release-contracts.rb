@@ -321,6 +321,8 @@ check.call("HCP Terraform credentials stay outside backend configuration and pla
     assert.call(setup_steps.length == 1, "#{path} must have exactly one Terraform setup step")
     setup_token = setup_steps.first.dig("with", "cli_config_credentials_token")
     assert.call(setup_token == hcp_token_secret, "#{path} does not inject the protected HCP token through Terraform CLI credentials")
+    setup_hostname = setup_steps.first.dig("with", "cli_config_credentials_hostname")
+    assert.call(setup_hostname == "app.terraform.io", "#{path} configures Terraform credentials for the wrong hostname")
     token_references = JSON.generate(job).scan(hcp_token_secret).length
     assert.call(token_references == 1, "#{path} exposes the HCP token outside the Terraform CLI credential input")
 
@@ -334,6 +336,7 @@ check.call("HCP Terraform credentials stay outside backend configuration and pla
   end
 
   terraform_job = terraform_jobs.fetch(".github/workflows/terraform-apply.yml")
+  assert.call(terraform_job.dig("environment", "name") == "staging", "Terraform plan job is missing the protected staging environment")
   uploads_artifact = terraform_job.fetch("steps").any? { |step| uses_action.call(step, "actions/upload-artifact") }
   assert.call(!uploads_artifact, "Terraform workflow uploads a plan artifact that could retain backend data")
 
