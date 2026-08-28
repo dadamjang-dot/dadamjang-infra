@@ -173,7 +173,11 @@ Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public
 
 API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다. Node base는 공식 `linux/amd64` manifest digest로 고정하고 build와 Fargate runtime도 각각 `linux/amd64`, `X86_64`로 고정한다. Push 또는 tag 재사용 후 ECR에서 digest를 다시 조회해 `repository@sha256:...`만 task definition에 등록한다.
 
-배포는 ECS service가 현재 사용하는 task definition ARN을 먼저 읽는다. Terraform state의 `ecs_task_definition_arn`이 가리키는 reviewed definition과 image 및 `SENTRY_RELEASE`를 제외한 container/task runtime contract가 일치하고 PostgreSQL TLS 환경과 secret reference가 유효할 때만 현재 service definition에 새 image digest를 렌더링한다. 따라서 이 output을 추가하거나 runtime contract를 변경한 Terraform commit은 먼저 staging apply해야 한다.
+배포는 ECR digest를 확정한 뒤 해당 image 안의 `/app/retired-migrations/0005_catalog_demo_products.sql`을 실행 환경에서 직접 읽어 historical SHA-256 `44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f`와 일치하는지 확인한다. 검증되지 않은 digest는 task definition에 전달하지 않는다.
+
+`ecs_release_contract`는 Terraform이 만든 canonical task definition, apply 시점에 refresh한 ECS service의 exact task-definition revision, ECR repository, runtime secret 이름, task-contract source hash를 하나로 묶는다. API deploy는 live service의 exact revision을 읽고 canonical contract를 엄격히 검증한 다음 canonical definition에서 새 digest와 `SENTRY_RELEASE`만 바꿔 등록한다. Live contract가 canonical과 이미 같으면 일반 image-only deploy로 진행한다. Contract가 다르면 live revision이 Terraform apply가 관측한 revision과 정확히 같을 때만 한 번의 contract transition을 허용한다. 따라서 service drift나 다른 infra commit의 stale state는 자동 승인되지 않는다.
+
+기존 staging에 이 output 또는 새 runtime contract를 처음 적용할 때는 secrets를 먼저 준비하고, 같은 infra commit으로 staging Terraform plan을 검토한 뒤 apply한다. 이 apply는 `ignore_changes = [task_definition]` 때문에 mutable/placeholder image로 service를 재배포하지 않고 새 canonical revision과 현재 service revision을 state에 기록한다. 그 다음 같은 commit의 API deploy를 실행하면 immutable digest를 사용해 canonical contract로 전환한다. 이후 image-only deploy는 별도 Terraform apply가 필요 없으며, 미래 runtime contract 변경에는 같은 Terraform plan/apply → API deploy 순서를 반복한다. Apply 이후 live revision이 예상과 다르면 drift를 조사·복구한 뒤 새 plan을 검토해야 하며 state만 다시 승인해서는 안 된다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

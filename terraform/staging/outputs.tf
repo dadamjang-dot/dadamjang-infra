@@ -44,6 +44,22 @@ output "ecs_task_family" {
   value       = aws_ecs_task_definition.api.family
 }
 
+output "ecs_release_contract" {
+  description = "Reviewed target and exact service revision observed by the latest Terraform apply."
+  value = {
+    canonical_task_definition_arn        = aws_ecs_task_definition.api.arn
+    image_repository                     = aws_ecr_repository.api.repository_url
+    observed_service_task_definition_arn = aws_ecs_service.api.task_definition
+    runtime_secret_names                 = sort(concat(["POSTGRES_PASSWORD"], tolist(local.runtime_secret_keys)))
+    source_hashes = {
+      "application.tf" = filesha256("${path.module}/application.tf")
+      "locals.tf"      = filesha256("${path.module}/locals.tf")
+      "variables.tf"   = filesha256("${path.module}/variables.tf")
+    }
+    task_family = aws_ecs_task_definition.api.family
+  }
+}
+
 output "github_api_deploy_role_arn" {
   description = "OIDC role ARN for the GitHub workflow that pushes and deploys the API."
   value       = aws_iam_role.github_api_deploy.arn

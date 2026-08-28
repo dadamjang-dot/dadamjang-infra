@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 require "fileutils"
+require "digest"
 require "json"
 require "open3"
 require "set"
@@ -30,6 +31,10 @@ end
 
 step_named = lambda do |job, name|
   job.fetch("steps").find { |step| step["name"] == name } || raise("missing step #{name}")
+end
+
+uses_action = lambda do |step, action|
+  step["uses"].to_s.start_with?("#{action}@")
 end
 
 active_hcl = lambda do |path|
@@ -118,6 +123,10 @@ check.call("Docker build and runtime use backend build outputs") do
     instructions.include?('CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]'),
     "runtime command does not use emitted paths",
   )
+  assert.call(
+    instructions.include?("COPY --from=build --chown=node:node /app/retired-migrations ./retired-migrations"),
+    "runtime image omits retired migration history",
+  )
 end
 
 check.call("Docker runtime ships the checksum-verified AWS RDS CA bundle") do
@@ -169,6 +178,19 @@ check.call("infra CI watches release behavior and documentation") do
     configured_paths = infra_ci_triggers.fetch(event).fetch("paths").to_set
     missing_paths = required_paths - configured_paths
     assert.call(missing_paths.empty?, "#{event} omits #{missing_paths.to_a.join(", ")}")
+  end
+end
+
+check.call("privileged workflows execute only commit-pinned actions") do
+  {
+    ".github/workflows/api-deploy.yml" => workflow,
+    ".github/workflows/infra-ci.yml" => infra_ci,
+  }.each do |path, definition|
+    mutable = definition.fetch("jobs").values.flat_map { |job| job.fetch("steps") }
+      .map { |step| step["uses"] }
+      .compact
+      .reject { |uses| uses.match?(%r{\A[^@\s]+@[0-9a-f]{40}\z}) }
+    assert.call(mutable.empty?, "#{path} has mutable action refs: #{mutable.join(", ")}")
   end
 end
 
@@ -224,7 +246,7 @@ check.call("deploy consumes only the tested release identity") do
   assert.call(deploy_job.fetch("concurrency") == { "group" => "staging-api-deploy", "cancel-in-progress" => false }, "deploy can be canceled mid-release")
   assert.call(deploy_job.dig("environment", "name") == "staging", "staging approval is missing")
   backend_checkouts = deploy_job.fetch("steps").select do |step|
-    step["uses"] == "actions/checkout@v4" && step.dig("with", "repository") == "dadamjang-dot/dadamjang-be"
+    uses_action.call(step, "actions/checkout") && step.dig("with", "repository") == "dadamjang-dot/dadamjang-be"
   end
   assert.call(backend_checkouts.length == 1, "deploy must have exactly one backend checkout")
   assert.call(
@@ -242,17 +264,15 @@ check.call("deploy consumes only the tested release identity") do
     publish.fetch("run").start_with?("bash infra/scripts/publish-backend-image.sh "),
     "workflow does not invoke the image publisher through bash",
   )
-  render_steps = deploy_job.fetch("steps").select { |step| step["uses"] == "aws-actions/amazon-ecs-render-task-definition@v1" }
-  assert.call(render_steps.length == 1, "deploy must render exactly one image reference")
-  render = render_steps.first
-  expected_image = "${{ steps.image.outputs.reference }}"
-  assert.call(render.dig("with", "image") == expected_image, "rendered image is not the tested image")
-  release_environment = render.dig("with", "environment-variables").to_s.lines(chomp: true).to_h do |line|
-    line.split("=", 2)
-  end
   assert.call(
-    release_environment["SENTRY_RELEASE"] == "${{ needs.test.outputs.image_tag }}",
-    "deployed Sentry release is not the tested immutable image tag",
+    deploy_job.fetch("steps").none? { |step| step["uses"].to_s.start_with?("aws-actions/amazon-ecs-render-task-definition@") },
+    "an action can mutate the reviewed task definition after preparation",
+  )
+  prepare = step_named.call(deploy_job, "Prepare reviewed ECS task definition")
+  assert.call(prepare.dig("env", "IMAGE_REFERENCE") == "${{ steps.image.outputs.reference }}", "prepared image is not the tested digest")
+  assert.call(
+    prepare.dig("env", "SENTRY_RELEASE") == "${{ needs.test.outputs.image_tag }}",
+    "prepared Sentry release is not the tested immutable image tag",
   )
 end
 
@@ -277,11 +297,16 @@ check.call("image publication resolves an amd64 ECR digest after push") do
     write_executable.call(File.join(fake_bin, "docker"), <<~SH)
       #!/usr/bin/env bash
       printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+      if [[ "$1" == "run" ]]; then
+        cat > "$FAKE_CHECKSUM_INPUT"
+        [[ "$FAKE_IMAGE_CHECKSUM" != "invalid" ]] || exit 1
+      fi
       printf '%s\n' 'docker progress'
     SH
     base_env = {
       "PATH" => "#{fake_bin}:#{ENV.fetch("PATH")}",
       "FAKE_AWS_LOG" => File.join(directory, "aws.log"),
+      "FAKE_CHECKSUM_INPUT" => File.join(directory, "checksum-input"),
       "FAKE_DOCKER_LOG" => docker_log,
     }
     command = [
@@ -292,8 +317,20 @@ check.call("image publication resolves an amd64 ECR digest after push") do
     stdout, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "existing"), *command, chdir: root)
     assert.call(status.success?, stderr)
     assert.call(stdout.strip == "registry.example/api@sha256:#{"a" * 64}", "existing tag did not resolve to a digest reference")
-    assert.call(!File.exist?(docker_log), "existing image was rebuilt")
+    immutable_reference = "registry.example/api@sha256:#{"a" * 64}"
+    expected_verification = [
+      "pull --platform linux/amd64 #{immutable_reference}",
+      "run --rm --platform linux/amd64 --interactive --entrypoint sha256sum #{immutable_reference} -c -",
+    ]
+    assert.call(File.exist?(docker_log), "existing image digest was not pulled and verified")
+    assert.call(File.readlines(docker_log, chomp: true) == expected_verification, "existing image was not verified by digest")
+    assert.call(
+      File.read(base_env.fetch("FAKE_CHECKSUM_INPUT")) ==
+        "44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f  /app/retired-migrations/0005_catalog_demo_products.sql\n",
+      "runtime verification does not enforce the historical retired migration checksum",
+    )
 
+    FileUtils.rm_f(docker_log)
     stdout, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "missing"), *command, chdir: root)
     assert.call(status.success?, stderr)
     assert.call(stdout.strip == "registry.example/api@sha256:#{"a" * 64}", "pushed tag did not resolve to a digest reference")
@@ -301,85 +338,122 @@ check.call("image publication resolves an amd64 ECR digest after push") do
       File.readlines(docker_log, chomp: true) == [
         "build --platform linux/amd64 --file infra/docker/backend.Dockerfile --tag registry.example/api:release-tag backend",
         "push registry.example/api:release-tag",
-      ],
+      ] + expected_verification,
       "missing image did not build and push once",
     )
 
-    File.delete(docker_log)
+    FileUtils.rm_f(docker_log)
     _, _, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "denied"), *command, chdir: root)
     assert.call(!status.success?, "unexpected ECR error was treated as a missing image")
     assert.call(!File.exist?(docker_log), "unexpected ECR error triggered Docker")
+
+    stdout, _, status = Open3.capture3(
+      base_env.merge("FAKE_ECR_RESULT" => "existing", "FAKE_IMAGE_CHECKSUM" => "invalid"),
+      *command,
+      chdir: root,
+    )
+    assert.call(!status.success?, "image with missing or changed retired migration was accepted")
+    assert.call(stdout.empty?, "unverified image reference was emitted")
   end
 end
 
-check.call("release preparation uses the deployed service and Terraform task contract") do
-  prepare = step_named.call(deploy_job, "Read deployed ECS task definition")
+check.call("deploy wires the tested digest into canonical task preparation") do
+  prepare = step_named.call(deploy_job, "Prepare reviewed ECS task definition")
   assert.call(
     prepare.fetch("run").strip == "bash infra/scripts/prepare-ecs-task-definition.sh infra/terraform/staging task-definition.json",
-    "workflow does not prepare the deployed task definition through the contract script",
+    "workflow does not prepare the canonical task definition through the contract script",
   )
   assert.call(!deploy_job.fetch("env").key?("AWS_ECS_TASK_FAMILY"), "deploy still selects a task definition by family")
-  output = hcl_block.call("terraform/staging/outputs.tf", /output\s+"ecs_task_definition_arn"/)
-  assert.call(hcl_arguments.call(output)["value"] == "aws_ecs_task_definition.api.arn", "Terraform state does not expose the reviewed task definition ARN")
+end
 
+check.call("Terraform state exports an exact ECS release transition contract") do
+  release_output = hcl_block.call("terraform/staging/outputs.tf", /output\s+"ecs_release_contract"/)
+  %w[
+    canonical_task_definition_arn
+    observed_service_task_definition_arn
+    task_family
+    image_repository
+    runtime_secret_names
+    source_hashes
+  ].each do |field|
+    assert.call(release_output.include?(field), "Terraform release contract omits #{field}")
+  end
+end
+
+check.call("release preparation bridges only a Terraform-observed service revision to the canonical contract") do
   Dir.mktmpdir("prepare-ecs") do |directory|
     fake_bin = File.join(directory, "bin")
     FileUtils.mkdir_p(fake_bin)
     aws_log = File.join(directory, "aws.log")
     output = File.join(directory, "task-definition.json")
-    canonical_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:40"
-    deployed_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:41"
-    canonical = {
-      "taskDefinitionArn" => canonical_arn,
-      "containerDefinitions" => [{
-        "name" => "api",
-        "image" => "registry.example/api:bootstrap",
-        "essential" => true,
-        "environment" => [
-          { "name" => "NODE_ENV", "value" => "production" },
-          { "name" => "POSTGRES_SSL", "value" => "true" },
-          { "name" => "POSTGRES_SSL_CA_PATH", "value" => "/etc/ssl/certs/aws-rds-global-bundle.pem" },
-          { "name" => "SENTRY_RELEASE", "value" => "bootstrap" },
-        ],
-        "secrets" => [{ "name" => "POSTGRES_PASSWORD", "valueFrom" => "arn:aws:secretsmanager:database:password::" }],
-      }],
-      "family" => "dadamjang-staging-api",
-      "taskRoleArn" => "arn:aws:iam::123456789012:role/task",
-      "executionRoleArn" => "arn:aws:iam::123456789012:role/execution",
-      "networkMode" => "awsvpc",
-      "revision" => 40,
-      "volumes" => [],
-      "status" => "ACTIVE",
-      "requiresAttributes" => [],
-      "placementConstraints" => [],
-      "compatibilities" => ["EC2", "FARGATE"],
-      "requiresCompatibilities" => ["FARGATE"],
-      "cpu" => "256",
-      "memory" => "512",
-      "runtimePlatform" => { "cpuArchitecture" => "X86_64", "operatingSystemFamily" => "LINUX" },
-      "registeredAt" => "2026-08-28T00:00:00Z",
-      "registeredBy" => "terraform",
-    }
-    deployed = JSON.parse(JSON.generate(canonical))
-    deployed["taskDefinitionArn"] = deployed_arn
-    deployed["revision"] = 41
-    deployed["registeredAt"] = "2026-08-29T00:00:00Z"
-    deployed["registeredBy"] = "github"
-    deployed["containerDefinitions"][0]["image"] = "registry.example/api@sha256:#{"b" * 64}"
-    deployed["containerDefinitions"][0]["environment"].find { |item| item["name"] == "SENTRY_RELEASE" }["value"] = "release-tag"
     canonical_path = File.join(directory, "canonical.json")
     deployed_path = File.join(directory, "deployed.json")
-    File.write(canonical_path, JSON.generate({ "taskDefinition" => canonical }))
-    File.write(deployed_path, JSON.generate({ "taskDefinition" => deployed }))
+    service_path = File.join(directory, "service.json")
+    release_contract_path = File.join(directory, "release-contract.json")
+    family = "dadamjang-staging-api"
+    canonical_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:50"
+    old_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:41"
+    target_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:51"
+    image_reference = "registry.example/api@sha256:#{"c" * 64}"
+    secret_names = %w[JWT_ACCESS_SECRET POSTGRES_PASSWORD]
+    source_hashes = %w[application.tf locals.tf variables.tf].to_h do |name|
+      [name, Digest::SHA256.file(File.join(root, "terraform/staging", name)).hexdigest]
+    end
+    build_task = lambda do |arn:, image:, release:, memory: "512"|
+      {
+        "taskDefinitionArn" => arn,
+        "containerDefinitions" => [{
+          "name" => "api",
+          "image" => image,
+          "essential" => true,
+          "environment" => [
+            { "name" => "NODE_ENV", "value" => "production" },
+            { "name" => "POSTGRES_SSL", "value" => "true" },
+            { "name" => "POSTGRES_SSL_CA_PATH", "value" => "/etc/ssl/certs/aws-rds-global-bundle.pem" },
+            { "name" => "SENTRY_RELEASE", "value" => release },
+          ],
+          "secrets" => secret_names.map do |name|
+            { "name" => name, "valueFrom" => "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:runtime:#{name}::" }
+          end,
+        }],
+        "family" => family,
+        "taskRoleArn" => "arn:aws:iam::123456789012:role/task",
+        "executionRoleArn" => "arn:aws:iam::123456789012:role/execution",
+        "networkMode" => "awsvpc",
+        "revision" => arn.split(":").last.to_i,
+        "volumes" => [],
+        "status" => "ACTIVE",
+        "requiresAttributes" => [],
+        "placementConstraints" => [],
+        "compatibilities" => ["EC2", "FARGATE"],
+        "requiresCompatibilities" => ["FARGATE"],
+        "cpu" => "256",
+        "memory" => memory,
+        "runtimePlatform" => { "cpuArchitecture" => "X86_64", "operatingSystemFamily" => "LINUX" },
+        "registeredAt" => "2026-08-29T00:00:00Z",
+        "registeredBy" => "terraform",
+      }
+    end
+    canonical = build_task.call(arn: canonical_arn, image: "registry.example/api:bootstrap", release: "bootstrap")
+    old = build_task.call(arn: old_arn, image: "registry.example/api@sha256:#{"b" * 64}", release: "old", memory: "256")
+    release_contract = {
+      "canonical_task_definition_arn" => canonical_arn,
+      "observed_service_task_definition_arn" => old_arn,
+      "task_family" => family,
+      "image_repository" => "registry.example/api",
+      "runtime_secret_names" => secret_names,
+      "source_hashes" => source_hashes,
+    }
     write_executable.call(File.join(fake_bin, "terraform"), <<~SH)
       #!/usr/bin/env bash
-      printf '%s\n' "$FAKE_CANONICAL_ARN"
+      [[ "$*" == *"output -json ecs_release_contract"* ]] || exit 2
+      cat "$FAKE_RELEASE_CONTRACT"
     SH
     write_executable.call(File.join(fake_bin, "aws"), <<~SH)
       #!/usr/bin/env bash
       printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
       if [[ "$1 $2" == "ecs describe-services" ]]; then
-        printf '%s\n' "$FAKE_DEPLOYED_ARN"
+        cat "$FAKE_SERVICE"
       elif [[ "$*" == *"$FAKE_CANONICAL_ARN"* ]]; then
         cat "$FAKE_CANONICAL_TASK"
       elif [[ "$*" == *"$FAKE_DEPLOYED_ARN"* ]]; then
@@ -388,49 +462,144 @@ check.call("release preparation uses the deployed service and Terraform task con
         exit 2
       fi
     SH
+    write_state = lambda do |deployed:, observed: release_contract.fetch("observed_service_task_definition_arn"), service_name: "staging-service"|
+      File.write(canonical_path, JSON.generate({ "taskDefinition" => canonical }))
+      File.write(deployed_path, JSON.generate({ "taskDefinition" => deployed }))
+      File.write(
+        service_path,
+        JSON.generate({
+          "services" => [{ "serviceName" => service_name, "status" => "ACTIVE", "taskDefinition" => deployed.fetch("taskDefinitionArn") }],
+          "failures" => [],
+        }),
+      )
+      File.write(
+        release_contract_path,
+        JSON.generate(release_contract.merge("observed_service_task_definition_arn" => observed)),
+      )
+    end
+    write_state.call(deployed: old)
     env = {
       "PATH" => "#{fake_bin}:#{ENV.fetch("PATH")}",
       "FAKE_AWS_LOG" => aws_log,
       "FAKE_CANONICAL_ARN" => canonical_arn,
-      "FAKE_DEPLOYED_ARN" => deployed_arn,
+      "FAKE_DEPLOYED_ARN" => old_arn,
       "FAKE_CANONICAL_TASK" => canonical_path,
       "FAKE_DEPLOYED_TASK" => deployed_path,
+      "FAKE_RELEASE_CONTRACT" => release_contract_path,
+      "FAKE_SERVICE" => service_path,
       "AWS_ECS_CLUSTER" => "staging-cluster",
       "AWS_ECS_SERVICE" => "staging-service",
+      "IMAGE_REFERENCE" => image_reference,
+      "SENTRY_RELEASE" => "release-tag",
     }
     command = ["bash", File.join(root, "scripts/prepare-ecs-task-definition.sh"), "terraform/staging", output]
+
     _, stderr, status = Open3.capture3(env, *command, chdir: root)
-    assert.call(status.success?, stderr)
-    assert.call(JSON.parse(File.read(output)) == deployed, "prepared task definition is not the deployed service revision")
+    assert.call(status.success?, stderr.empty? ? "preparer did not consume the Terraform release transition" : stderr)
+    expected_target = JSON.parse(JSON.generate(canonical))
+    expected_api = expected_target.fetch("containerDefinitions").first
+    expected_api["image"] = image_reference
+    expected_api.fetch("environment").find { |item| item["name"] == "SENTRY_RELEASE" }["value"] = "release-tag"
+    assert.call(JSON.parse(File.read(output)) == expected_target, "contract transition did not prepare the canonical target")
     calls = File.readlines(aws_log, chomp: true)
     assert.call(calls.first.include?("ecs describe-services"), "service task definition was not resolved first")
-    assert.call(calls.none? { |call| call.include?("--task-definition dadamjang-staging-api ") }, "task family latest was queried")
+    assert.call(calls.none? { |call| call.include?("--task-definition #{family} ") }, "task family latest was queried")
 
-    drifted = JSON.parse(JSON.generate(deployed))
-    drifted["containerDefinitions"][0]["secrets"] = []
-    File.write(deployed_path, JSON.generate({ "taskDefinition" => drifted }))
+    post_transition = JSON.parse(JSON.generate(expected_target))
+    post_transition["taskDefinitionArn"] = target_arn
+    post_transition["revision"] = 51
+    post_transition["registeredBy"] = "github"
+    write_state.call(deployed: post_transition)
     FileUtils.rm_f(output)
-    _, _, drift_status = Open3.capture3(env, *command, chdir: root)
-    assert.call(!drift_status.success?, "secret contract drift was accepted")
-    assert.call(!File.exist?(output), "invalid task definition was rendered")
+    _, stderr, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => target_arn), *command, chdir: root)
+    assert.call(status.success?, "post-transition steady state failed: #{stderr}")
 
-    invalid_tls = JSON.parse(JSON.generate(canonical))
-    invalid_tls["containerDefinitions"][0]["environment"].find { |item| item["name"] == "POSTGRES_SSL" }["value"] = "false"
-    File.write(canonical_path, JSON.generate({ "taskDefinition" => invalid_tls }))
-    File.write(deployed_path, JSON.generate({ "taskDefinition" => invalid_tls.merge("taskDefinitionArn" => deployed_arn, "revision" => 41) }))
-    _, _, tls_status = Open3.capture3(env, *command, chdir: root)
-    assert.call(!tls_status.success?, "matching task definitions with disabled PostgreSQL TLS were accepted")
+    write_state.call(deployed: canonical, observed: canonical_arn)
+    FileUtils.rm_f(output)
+    _, stderr, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+    assert.call(status.success?, "fresh bootstrap failed: #{stderr}")
+
+    write_state.call(deployed: canonical, observed: canonical_arn, service_name: "other-service")
+    FileUtils.rm_f(output)
+    _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+    assert.call(!status.success?, "a response for the wrong ECS service was accepted")
+
+    write_state.call(
+      deployed: old,
+      observed: "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:39",
+    )
+    FileUtils.rm_f(output)
+    _, _, status = Open3.capture3(env, *command, chdir: root)
+    assert.call(!status.success?, "stale Terraform service state authorized a contract transition")
+    assert.call(!File.exist?(output), "stale Terraform state produced a target")
+
+    unrelated_drift = JSON.parse(JSON.generate(old))
+    unrelated_drift["taskDefinitionArn"] = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:52"
+    unrelated_drift["revision"] = 52
+    unrelated_drift["taskRoleArn"] = "arn:aws:iam::123456789012:role/unreviewed"
+    write_state.call(deployed: unrelated_drift)
+    FileUtils.rm_f(output)
+    _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => unrelated_drift.fetch("taskDefinitionArn")), *command, chdir: root)
+    assert.call(!status.success?, "unrelated live service drift was accepted as a contract transition")
+
+    invalid_canonical_mutations = {
+      "task family" => ->(task) { task["family"] = "other-family" },
+      "task role" => ->(task) { task["taskRoleArn"] = "not-an-iam-role-arn" },
+      "secret set" => ->(task) { task["containerDefinitions"][0]["secrets"] = [] },
+      "PostgreSQL TLS" => lambda do |task|
+        task["containerDefinitions"][0]["environment"].find { |item| item["name"] == "POSTGRES_SSL" }["value"] = "false"
+      end,
+      "runtime platform" => ->(task) { task["runtimePlatform"]["cpuArchitecture"] = "ARM64" },
+      "API container" => ->(task) { task["containerDefinitions"][0]["name"] = "other" },
+    }
+    invalid_canonical_mutations.each do |name, mutate|
+      invalid = JSON.parse(JSON.generate(canonical))
+      mutate.call(invalid)
+      canonical.replace(invalid)
+      write_state.call(deployed: invalid, observed: canonical_arn)
+      FileUtils.rm_f(output)
+      _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+      assert.call(!status.success?, "invalid canonical #{name} was accepted")
+      canonical.replace(build_task.call(arn: canonical_arn, image: "registry.example/api:bootstrap", release: "bootstrap"))
+    end
+
+    stale_hashes = release_contract.merge("source_hashes" => source_hashes.merge("application.tf" => "0" * 64))
+    File.write(release_contract_path, JSON.generate(stale_hashes))
+    write_state.call(deployed: canonical, observed: canonical_arn)
+    File.write(release_contract_path, JSON.generate(stale_hashes))
+    FileUtils.rm_f(output)
+    _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+    assert.call(!status.success?, "Terraform state from different contract sources was accepted")
+
+    File.write(release_contract_path, JSON.generate(release_contract.merge("observed_service_task_definition_arn" => canonical_arn)))
+    _, _, status = Open3.capture3(
+      env.merge("FAKE_DEPLOYED_ARN" => canonical_arn, "IMAGE_REFERENCE" => "registry.example/api:mutable"),
+      *command,
+      chdir: root,
+    )
+    assert.call(!status.success?, "mutable image reference was accepted")
+
+    _, _, status = Open3.capture3(
+      env.merge(
+        "FAKE_DEPLOYED_ARN" => canonical_arn,
+        "IMAGE_REFERENCE" => "other.example/api@sha256:#{"c" * 64}",
+      ),
+      *command,
+      chdir: root,
+    )
+    assert.call(!status.success?, "image from outside the Terraform repository was accepted")
   end
 end
 
 check.call("migration and service deploy use one registered task definition") do
   register_steps = deploy_job.fetch("steps").select do |step|
-    step["uses"] == "aws-actions/amazon-ecs-deploy-task-definition@v2"
+    uses_action.call(step, "aws-actions/amazon-ecs-deploy-task-definition")
   end
   assert.call(register_steps.length == 1, "task definition is not registered exactly once")
   register = register_steps.first
   assert.call(register.fetch("id") == "register-task-definition", "registered ARN is not captured")
   assert.call(register.fetch("with").keys == ["task-definition"], "register action also deploys a service")
+  assert.call(register.dig("with", "task-definition") == "task-definition.json", "register action bypasses the prepared canonical target")
   deploy = step_named.call(deploy_job, "Migrate and deploy registered task definition")
   task_definition_output = "${{ steps.register-task-definition.outputs.task-definition-arn }}"
   assert.call(deploy.dig("env", "TASK_DEFINITION_ARN") == task_definition_output, "registered ARN is not passed to deploy")

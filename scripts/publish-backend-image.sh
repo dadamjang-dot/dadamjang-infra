@@ -36,4 +36,10 @@ if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   exit 1
 fi
 
-printf '%s@%s\n' "$registry/$repository" "$image_digest"
+image_reference="$registry/$repository@$image_digest"
+docker pull --platform linux/amd64 "$image_reference" >&2
+printf '%s\n' \
+  '44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f  /app/retired-migrations/0005_catalog_demo_products.sql' \
+  | docker run --rm --platform linux/amd64 --interactive --entrypoint sha256sum "$image_reference" -c - >&2
+
+printf '%s\n' "$image_reference"

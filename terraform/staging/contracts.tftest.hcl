@@ -35,4 +35,12 @@ run "release_contracts" {
     )
     error_message = "The staging task must run the published linux/amd64 image."
   }
+
+  assert {
+    condition = output.ecs_release_contract.runtime_secret_names == sort(concat(
+      ["POSTGRES_PASSWORD"],
+      tolist(local.runtime_secret_keys),
+    ))
+    error_message = "The ECS release transition must export the exact runtime secret contract."
+  }
 }
