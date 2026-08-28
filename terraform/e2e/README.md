@@ -7,7 +7,7 @@ Isolated AWS root for mobile automation. It owns the `dadamjang_e2e` PostgreSQL 
 1. Create the GitHub Actions OIDC provider `https://token.actions.githubusercontent.com` once in the AWS account.
 2. Issue an ACM certificate in `aws_region` and create DNS for `api_hostname` targeting `api_alb_dns_name`.
 3. Apply this root with separate e2e remote state. Never reuse the staging workspace or backend key.
-4. Put the required JSON keys from `local.runtime_secret_keys` into Secrets Manager secret `dadamjang-e2e/api-runtime`. Terraform creates only the empty secret container; values never enter Terraform state or outputs.
+4. Put the required JSON keys from `local.runtime_secret_keys` into Secrets Manager secret `dadamjang-e2e/api-runtime`. The e2e task runs the same backend image as staging, so its shared runtime keys stay synchronized while values remain environment-specific. Terraform creates only the empty secret container; values never enter Terraform state or outputs.
 5. Push an immutable backend image to `api_ecr_repository_url`, then apply with its tag as `api_image_tag`.
 6. The backend image must provide `pnpm e2e:reset`. The command must reject any run unless `NODE_ENV=e2e` and `POSTGRES_DATABASE=dadamjang_e2e`; the task definition fixes both values.
 7. Create the `mobile-e2e` GitHub Environment in `dadamjang-dot/dadamjang-fe`. Restrict deployment branches to trusted same-repository branches and deny fork pull requests. Store outputs as repository/environment variables; no static AWS credentials or runtime secrets are needed.

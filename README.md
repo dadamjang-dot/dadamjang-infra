@@ -77,7 +77,7 @@ ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `20
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
 
-API deploy role은 ECR push와 ECS task definition/service 갱신만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. Terraform apply workflow은 `staging` Environment 보호 규칙(Required reviewers)을 반드시 설정한 뒤 사용한다.
+API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform apply와 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
 
 현재 `staging` Environment variables는 아래 기본 naming으로 등록되어 있다.
 
@@ -103,11 +103,23 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
 
 ```json
 {
+  "API_PUBLIC_BASE_URL": "https://api.staging.example.com",
+  "CLIENT_URL": "https://staging.example.com",
+  "DADAMJANG_BO_URL": "https://bo.staging.example.com",
+  "IDENTITY_CI_PEPPER": "replace-me",
+  "IDENTITY_INICIS_API_KEY": "replace-me",
+  "IDENTITY_INICIS_CALLBACK_BASE_URL": "https://api.staging.example.com",
+  "IDENTITY_INICIS_MID": "replace-me",
+  "IDENTITY_INICIS_SEED_IV": "replace-me",
+  "JWT_ACCESS_TOKEN_EXP": "15m",
   "JWT_ACCESS_TOKEN_SECRET": "replace-me",
+  "JWT_REFRESH_TOKEN_EXP": "7d",
   "JWT_REFRESH_TOKEN_SECRET": "replace-me",
   "EMAIL_CODE_PEPPER": "replace-me",
   "KAKAO_CLIENT_ID": "replace-me",
+  "KAKAO_CALLBACK_URL": "https://api.staging.example.com/api/auth/kakao/callback",
   "RESEND_API_KEY": "replace-me",
+  "RESEND_FROM_EMAIL": "no-reply@example.com",
   "CLOUDFLARE_R2_ENDPOINT": "https://<account-id>.r2.cloudflarestorage.com",
   "CLOUDFLARE_R2_ACCESS_KEY_ID": "replace-me",
   "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "replace-me",
@@ -116,6 +128,8 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
   "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://imagedelivery.net/<account-hash>"
 }
 ```
+
+새 task definition을 등록하기 전에 위 JSON의 모든 key를 실제 값으로 새 secret version에 등록해야 한다. Terraform은 JSON 값이 아니라 key별 ECS 참조만 추가하므로, 누락된 key가 있으면 새 task가 시작되지 않는다. OIDC trust 변경을 먼저 Terraform apply한 뒤 API deploy를 실행한다.
 
 예시 JSON을 실제 값으로 저장한 뒤 다음처럼 등록한다.
 
@@ -132,6 +146,8 @@ Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public
 - `infra-ci.yml`: infra PR/main 변경 시 Compose config, Terraform fmt, Terraform validate를 수행한다. state backend 없이 validate한다.
 - `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 plan 또는 apply한다.
 - `api-deploy.yml`: `repository_dispatch` 타입 `backend-main` 또는 수동 실행으로 BE를 lint/test/build하고 ECR push, ECS deploy를 수행한다. deploy job은 `staging` Environment 승인을 요구한다.
+
+API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

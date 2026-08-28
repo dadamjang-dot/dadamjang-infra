@@ -18,6 +18,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    outputs:
+      backend_sha: ${{ steps.release.outputs.backend_sha }}
+      image_tag: ${{ steps.release.outputs.image_tag }}
     services:
       postgres:
         image: postgres:16-alpine
@@ -37,9 +40,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: infra
+      - uses: actions/checkout@v4
+        with:
           repository: dadamjang-dot/dadamjang-be
           ref: ${{ env.BACKEND_REF }}
           path: backend
+      - name: Resolve release identity
+        id: release
+        run: |
+          backend_sha=$(git -C backend rev-parse HEAD)
+          dockerfile_sha=$(git -C infra hash-object docker/backend.Dockerfile)
+          echo "backend_sha=$backend_sha" >> "$GITHUB_OUTPUT"
+          echo "image_tag=backend-${backend_sha}-dockerfile-${dockerfile_sha}" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v4
         with:
           version: 10.13.1
@@ -64,6 +77,9 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    concurrency:
+      group: staging-api-deploy
+      cancel-in-progress: true
     environment:
       name: staging
     env:
@@ -72,7 +88,6 @@ jobs:
       AWS_ECS_TASK_FAMILY: ${{ vars.AWS_ECS_TASK_FAMILY }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ROLE_ARN: ${{ secrets.AWS_API_DEPLOY_ROLE_ARN }}
-      BACKEND_REF: ${{ github.event.client_payload.ref || inputs.backend_ref || 'main' }}
       ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
     steps:
       - uses: actions/checkout@v4
@@ -81,44 +96,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: dadamjang-dot/dadamjang-be
-          ref: ${{ env.BACKEND_REF }}
+          ref: ${{ needs.test.outputs.backend_sha }}
           path: backend
-      - name: Resolve backend image tag
-        id: backend-commit
-        run: echo "sha=$(git -C backend rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr-login
-      - name: Build and push immutable image
+      - name: Build or reuse immutable image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ steps.backend-commit.outputs.sha }}
-        run: |
-          docker build --file infra/docker/backend.Dockerfile --tag "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" backend
-          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-      - name: Run database migrations
-        env:
-          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.backend-commit.outputs.sha }}
-        run: |
-          network_config=$(aws ecs describe-services --cluster "$AWS_ECS_CLUSTER" --service "$AWS_ECS_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
-          subnets=$(echo "$network_config" | jq -r '.subnets | join(",")')
-          security_groups=$(echo "$network_config" | jq -r '.securityGroups | join(",")')
-          task_arn=$(aws ecs run-task \
-            --cluster "$AWS_ECS_CLUSTER" \
-            --task-definition "$AWS_ECS_TASK_FAMILY" \
-            --launch-type FARGATE \
-            --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_groups],assignPublicIp=DISABLED}" \
-            --overrides "{\"containerOverrides\":[{\"name\":\"api\",\"image\":\"$IMAGE\",\"command\":[\"node\",\"dist/scripts/migrate.js\"]}]}" \
-            --query 'tasks[0].taskArn' --output text)
-          aws ecs wait tasks-stopped --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn"
-          exit_code=$(aws ecs describe-tasks --cluster "$AWS_ECS_CLUSTER" --tasks "$task_arn" --query 'tasks[0].containers[0].exitCode' --output text)
-          if [ "$exit_code" != "0" ]; then
-            echo "Migration failed with exit code $exit_code"
-            exit 1
-          fi
+          IMAGE_TAG: ${{ needs.test.outputs.image_tag }}
+        run: bash infra/scripts/publish-backend-image.sh "$REGISTRY" "$ECR_REPOSITORY" "$IMAGE_TAG" infra/docker/backend.Dockerfile backend
       - name: Read active ECS task definition
         run: aws ecs describe-task-definition --task-definition "$AWS_ECS_TASK_FAMILY" --query taskDefinition > task-definition.json
       - uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -126,14 +116,12 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: api
-          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.backend-commit.outputs.sha }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.test.outputs.image_tag }}
       - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        id: register-task-definition
         with:
           task-definition: ${{ steps.task-definition.outputs.task-definition }}
-          service: ${{ env.AWS_ECS_SERVICE }}
-          cluster: ${{ env.AWS_ECS_CLUSTER }}
-          wait-for-service-stability: true
-      - name: Start the staging API service
-        run: |
-          aws ecs update-service --cluster "$AWS_ECS_CLUSTER" --service "$AWS_ECS_SERVICE" --desired-count 1 >/dev/null
-          aws ecs wait services-stable --cluster "$AWS_ECS_CLUSTER" --services "$AWS_ECS_SERVICE"
+      - name: Migrate and deploy registered task definition
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.register-task-definition.outputs.task-definition-arn }}
+        run: bash infra/scripts/deploy-ecs-release.sh

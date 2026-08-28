@@ -33,7 +33,7 @@ jobs:
       - name: Validate Docker Compose
         run: docker compose --env-file .env.example config --quiet
       - name: Guard release contracts
-        run: bash tests/release-contracts.sh
+        run: ruby tests/release-contracts.rb
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive terraform
       - name: Guard e2e isolation and scale-down contract
