@@ -40,23 +40,32 @@ cd terraform/staging
 terraform init -backend=false
 terraform fmt -recursive
 terraform validate
-terraform plan
 ```
 
-`terraform apply`는 실행하지 않는다. GitHub `staging` Environment 승인 후 `terraform-apply.yml`을 수동 실행한다.
+로컬 plan은 GitHub `staging` Environment와 같은 보호 값을 환경 변수로 주입하고 원격 state를 선택한다.
+
+```bash
+export TF_VAR_acm_certificate_arn="arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
+export TF_VAR_api_hostname="api.staging.example.com"
+terraform init -reconfigure -backend-config=backend.hcl -backend-config=operations=false
+terraform plan -input=false
+```
+
+CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. Apply 자동화는 아직 제공하지 않는다. 향후 apply는 동일한 저장 plan을 별도 보호 승인 뒤 소비하는 계약으로 구현하거나, 그 전까지는 plan 생성·검토·apply를 하나의 통제된 out-of-band 수동 절차에서 수행한다.
 
 상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 또는 조직의 기존 원격 backend를 권장한다. `TF_BACKEND_CONFIG` GitHub Environment secret에 backend 설정을 HCL로 넣는다.
 
 ```hcl
 # 예: HCP Terraform remote backend 설정
 organization = "your-terraform-cloud-organization"
+operations   = false
 
 workspaces {
   name = "dadamjang-staging"
 }
 ```
 
-현재 root module은 backend block을 고정하지 않는다. CI가 위 설정을 `backend.hcl`로 전달한다. 로컬에서 원격 state를 쓸 때도 같은 backend 설정 파일을 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. CI가 위 partial 설정을 `backend.hcl`로 전달하고 `operations=false`를 강제하므로 plan은 GitHub runner에서 실행되며 HCP는 state만 저장한다. 로컬 plan도 Git에 포함되지 않는 같은 형식의 파일과 `operations=false`로 원격 state를 사용한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
 첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
@@ -90,6 +99,8 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_ECR_REPOSITORY` | Variable | `api_ecr_repository_url`의 repository 이름 부분 |
 | `AWS_ECS_CLUSTER` | Variable | `ecs_cluster_name` |
 | `AWS_ECS_SERVICE` | Variable | `ecs_service_name` |
+| `ACM_CERTIFICATE_ARN` | Variable | staging HTTPS listener 인증서 ARN |
+| `API_HOSTNAME` | Variable | staging API DNS hostname |
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
@@ -105,6 +116,8 @@ AWS_REGION=ap-northeast-2
 AWS_ECR_REPOSITORY=dadamjang-staging-api
 AWS_ECS_CLUSTER=dadamjang-staging-cluster
 AWS_ECS_SERVICE=dadamjang-staging-api
+ACM_CERTIFICATE_ARN=arn:aws:acm:ap-northeast-2:123456789012:certificate/example
+API_HOSTNAME=api.staging.example.com
 ```
 
 아래 secrets는 실제 AWS 계정과 원격 Terraform backend 값이 있어야 등록할 수 있다.
@@ -170,7 +183,7 @@ Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public
 ## GitHub Actions
 
 - `infra-ci.yml`: infra PR/main 변경 시 Compose config, Terraform fmt, Terraform validate를 수행한다. state backend 없이 validate한다.
-- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 plan 또는 apply한다.
+- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 보호된 입력과 원격 state로 plan만 실행한다.
 - `api-deploy.yml`: `repository_dispatch` 타입 `backend-main` 또는 수동 실행으로 BE를 lint/test/build하고 ECR push, ECS deploy를 수행한다. deploy job은 `staging` Environment 승인을 요구한다.
 
 API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다. Node base는 공식 `linux/amd64` manifest digest로 고정하고 build와 Fargate runtime도 각각 `linux/amd64`, `X86_64`로 고정한다. Push 또는 tag 재사용 후 ECR에서 digest를 다시 조회해 `repository@sha256:...`만 task definition에 등록한다.
@@ -179,7 +192,7 @@ API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Ima
 
 `ecs_release_contract`는 Terraform이 만든 canonical task definition, apply 시점에 refresh한 ECS service의 exact task-definition revision, ECR repository, runtime secret 이름, task-contract source hash를 하나로 묶는다. API deploy는 live service의 exact revision을 읽고 canonical contract를 엄격히 검증한 다음 canonical definition에서 새 digest와 `SENTRY_RELEASE`만 바꿔 등록한다. Live contract가 canonical과 이미 같으면 일반 image-only deploy로 진행한다. Contract가 다르면 live revision이 Terraform apply가 관측한 revision과 정확히 같을 때만 한 번의 contract transition을 허용한다. 따라서 service drift나 다른 infra commit의 stale state는 자동 승인되지 않는다.
 
-기존 staging에 이 output 또는 새 runtime contract를 처음 적용할 때는 secrets를 먼저 준비하고, 같은 infra commit으로 staging Terraform plan을 검토한 뒤 apply한다. 이 apply는 `ignore_changes = [task_definition]` 때문에 mutable/placeholder image로 service를 재배포하지 않고 새 canonical revision과 현재 service revision을 state에 기록한다. 그 다음 같은 commit의 API deploy를 실행하면 immutable digest를 사용해 canonical contract로 전환한다. 이후 image-only deploy는 별도 Terraform apply가 필요 없으며, 미래 runtime contract 변경에는 같은 Terraform plan/apply → API deploy 순서를 반복한다. Apply 이후 live revision이 예상과 다르면 drift를 조사·복구한 뒤 새 plan을 검토해야 하며 state만 다시 승인해서는 안 된다.
+기존 staging에 이 output 또는 새 runtime contract를 처음 적용할 때는 secrets를 먼저 준비하고, 통제된 out-of-band 절차에서 같은 infra commit으로 staging Terraform plan을 생성·검토한 뒤 그 저장 plan을 수동 apply한다. 이 apply는 `ignore_changes = [task_definition]` 때문에 mutable/placeholder image로 service를 재배포하지 않고 새 canonical revision과 현재 service revision을 state에 기록한다. 그 다음 같은 commit의 API deploy를 실행하면 immutable digest를 사용해 canonical contract로 전환한다. 이후 image-only deploy는 별도 Terraform apply가 필요 없으며, 미래 runtime contract 변경에는 같은 plan 검토와 수동 apply → API deploy 순서를 반복한다. Apply 이후 live revision이 예상과 다르면 drift를 조사·복구한 뒤 새 plan을 검토해야 하며 state만 다시 승인해서는 안 된다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

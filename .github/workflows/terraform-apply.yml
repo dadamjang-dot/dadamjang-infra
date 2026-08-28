@@ -1,16 +1,7 @@
-name: staging terraform apply
+name: staging terraform plan
 
 on:
   workflow_dispatch:
-    inputs:
-      action:
-        description: Terraform action to execute after GitHub Environment approval
-        required: true
-        default: plan
-        type: choice
-        options:
-          - plan
-          - apply
 
 permissions:
   contents: read
@@ -25,7 +16,13 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ROLE_ARN: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
       TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
+      TF_VAR_acm_certificate_arn: ${{ vars.ACM_CERTIFICATE_ARN }}
+      TF_VAR_api_hostname: ${{ vars.API_HOSTNAME }}
     steps:
+      - name: Validate Terraform inputs
+        run: |
+          : "${TF_VAR_acm_certificate_arn:?ACM_CERTIFICATE_ARN is required}"
+          : "${TF_VAR_api_hostname:?API_HOSTNAME is required}"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
@@ -38,9 +35,6 @@ jobs:
       - name: Write Terraform backend configuration
         run: printf '%s' "$TF_BACKEND_CONFIG" > terraform/staging/backend.hcl
       - name: Initialize Terraform state backend
-        run: terraform -chdir=terraform/staging init -input=false -backend-config=backend.hcl
+        run: terraform -chdir=terraform/staging init -input=false -backend-config=backend.hcl -backend-config=operations=false
       - name: Terraform plan
         run: terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan
-      - name: Terraform apply
-        if: ${{ inputs.action == 'apply' }}
-        run: terraform -chdir=terraform/staging apply -input=false staging.tfplan

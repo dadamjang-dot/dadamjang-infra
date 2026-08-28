@@ -155,14 +155,108 @@ check.call("infra CI runs native contracts for staging and e2e") do
   assert.call(step_named.call(validate, "Test e2e Terraform release contracts").fetch("run") == "terraform -chdir=terraform/e2e test", "e2e native contracts are not run")
 end
 
-check.call("staging ECS service waits for the HTTPS listener") do
-  graph, error, status = Open3.capture3("terraform", "-chdir=terraform/staging", "graph", "-type=plan", chdir: root)
-  assert.call(status.success?, error)
-  edges = graph.lines.map { |line| line.match(/^\s*"([^"]+)" -> "([^"]+)"/)&.captures }.compact
-  assert.call(
-    edges.include?(["[root] aws_ecs_service.api (expand)", "[root] aws_lb_listener.https (expand)"]),
-    "staging ECS service does not depend on the HTTPS listener",
+check.call("Terraform roots select remote state for partial backend configuration") do
+  %w[staging e2e].each do |environment|
+    Dir.mktmpdir("#{environment}-backend") do |directory|
+      backend_config = File.join(directory, "backend.hcl")
+      plugin_directory = File.join(directory, "plugins")
+      FileUtils.mkdir_p(plugin_directory)
+      File.write(backend_config, <<~HCL)
+        hostname     = "127.0.0.1"
+        organization = "example"
+
+        workspaces {
+          name = "dadamjang-#{environment}"
+        }
+      HCL
+      stdout, stderr, = Open3.capture3(
+        { "TF_DATA_DIR" => File.join(directory, "data") },
+        "terraform",
+        "-chdir=terraform/#{environment}",
+        "init",
+        "-input=false",
+        "-get=false",
+        "-backend-config=#{backend_config}",
+        "-plugin-dir=#{plugin_directory}",
+        "-no-color",
+        chdir: root,
+      )
+      output = stdout + stderr
+      assert.call(!output.include?("Missing backend configuration"), "#{environment} ignores its remote backend configuration")
+    end
+  end
+end
+
+check.call("Terraform workflow is plan-only with complete protected inputs") do
+  triggers = terraform_apply["on"] || terraform_apply.fetch(true)
+  dispatch = triggers.fetch("workflow_dispatch") || {}
+  terraform_job = terraform_apply.fetch("jobs").fetch("terraform")
+  terraform_env = terraform_job.fetch("env")
+  assert.call((dispatch["inputs"] || {}).empty?, "Terraform workflow still exposes an apply mode")
+  assert.call(terraform_env.fetch("TF_VAR_acm_certificate_arn") == "${{ vars.ACM_CERTIFICATE_ARN }}", "ACM certificate ARN is not supplied to Terraform")
+  assert.call(terraform_env.fetch("TF_VAR_api_hostname") == "${{ vars.API_HOSTNAME }}", "API hostname is not supplied to Terraform")
+
+  validation = step_named.call(terraform_job, "Validate Terraform inputs")
+  initialization = step_named.call(terraform_job, "Initialize Terraform state backend")
+  assert.call(terraform_job.fetch("steps").index(validation) < terraform_job.fetch("steps").index(initialization), "Terraform inputs are not validated before initialization")
+  assert.call(initialization.fetch("run").include?("-backend-config=operations=false"), "Terraform plan can execute outside the GitHub runner")
+  deploy_initialization = step_named.call(deploy_job, "Initialize Terraform state backend")
+  assert.call(deploy_initialization.fetch("run").include?("-backend-config=operations=false"), "release state reads can execute outside the GitHub runner")
+  _, _, empty_status = Open3.capture3(
+    { "TF_VAR_acm_certificate_arn" => nil, "TF_VAR_api_hostname" => nil },
+    "bash", "-eu", "-c", validation.fetch("run"),
+    chdir: root,
   )
+  _, valid_error, valid_status = Open3.capture3(
+    {
+      "TF_VAR_acm_certificate_arn" => "arn:aws:acm:ap-northeast-2:123456789012:certificate/example",
+      "TF_VAR_api_hostname" => "api.staging.example.test",
+    },
+    "bash", "-eu", "-c", validation.fetch("run"),
+    chdir: root,
+  )
+  assert.call(!empty_status.success?, "Terraform input validation accepts blank protected variables")
+  assert.call(valid_status.success?, valid_error)
+
+  workflow_definition = JSON.generate(terraform_apply)
+  assert.call(!workflow_definition.match?(/terraform\s+apply/), "Terraform workflow can still apply an unreviewed plan")
+  assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
+end
+
+check.call("staging ECS service waits for the HTTPS listener") do
+  Dir.mktmpdir("staging-graph") do |directory|
+    File.write(File.join(directory, "main.tf"), <<~HCL)
+      module "staging" {
+        source = #{JSON.generate(File.join(root, "terraform/staging"))}
+
+        acm_certificate_arn = "arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
+        api_hostname        = "api.staging.example.test"
+      }
+    HCL
+    provider_directory = if ENV["TF_DATA_DIR"]
+      File.join(ENV.fetch("TF_DATA_DIR"), "providers")
+    else
+      File.join(root, "terraform/staging/.terraform/providers")
+    end
+    terraform_data = File.join(directory, ".terraform-data")
+    _, init_error, init_status = Open3.capture3(
+      { "TF_DATA_DIR" => terraform_data },
+      "terraform", "-chdir=#{directory}", "init", "-backend=false", "-input=false", "-plugin-dir=#{provider_directory}",
+      chdir: root,
+    )
+    assert.call(init_status.success?, init_error)
+    graph, error, status = Open3.capture3(
+      { "TF_DATA_DIR" => terraform_data },
+      "terraform", "-chdir=#{directory}", "graph", "-type=plan",
+      chdir: root,
+    )
+    assert.call(status.success?, error)
+    edges = graph.lines.map { |line| line.match(/^\s*"([^"]+)" -> "([^"]+)"/)&.captures }.compact
+    assert.call(
+      edges.include?(["[root] module.staging.aws_ecs_service.api (expand)", "[root] module.staging.aws_lb_listener.https (expand)"]),
+      "staging ECS service does not depend on the HTTPS listener",
+    )
+  end
 end
 
 check.call("privileged workflows execute only commit-pinned actions") do
