@@ -11,6 +11,7 @@ require "yaml"
 root = File.expand_path("..", __dir__)
 workflow = YAML.load_file(File.join(root, ".github/workflows/api-deploy.yml"))
 infra_ci = YAML.load_file(File.join(root, ".github/workflows/infra-ci.yml"))
+compose = YAML.load_file(File.join(root, "docker-compose.yml"))
 infra_ci_triggers = infra_ci["on"] || infra_ci.fetch(true)
 jobs = workflow.fetch("jobs")
 test_job = jobs.fetch("test")
@@ -167,6 +168,17 @@ check.call("Docker image identity pins the amd64 Node base") do
   assert.call(healthcheck&.include?("node") && healthcheck.include?("/health/ready"), "runtime healthcheck does not use built-in Node readiness")
 end
 
+check.call("local development services use reviewed immutable images") do
+  expected = {
+    "postgres" => "postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
+    "redis" => "redis:7.4.9-alpine3.21@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99",
+    "minio" => "pgsty/silo:RELEASE.2026-08-06T00-00-00Z@sha256:29a498b24669cae1fed11c1a2fb2b3d73c68829a0a9c0b14e71b386671d38fac",
+    "mailpit" => "axllent/mailpit:v1.31.0@sha256:c96991d9bef73594c246d89ca81411d4e916f03e76a7d2d72fa2ab5dd3c9ce24",
+  }
+  actual = compose.fetch("services").to_h { |name, service| [name, service.fetch("image")] }
+  assert.call(actual == expected, "unreviewed local service images: #{actual}")
+end
+
 check.call("e2e task starts the emitted backend entrypoint") do
   application = active_hcl.call("terraform/e2e/application.tf")
   assert.call(application.include?('command = ["node", "dist/src/main.js"]'), "wrong e2e entrypoint")
@@ -196,7 +208,10 @@ end
 
 check.call("test job owns the PostgreSQL integration service") do
   postgres = test_job.fetch("services").fetch("postgres")
-  assert.call(postgres.fetch("image") == "postgres:16-alpine", "wrong PostgreSQL image")
+  assert.call(
+    postgres.fetch("image") == "postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
+    "wrong PostgreSQL image",
+  )
   assert.call(postgres.fetch("env").fetch("POSTGRES_DB") == "dadamjang_test", "wrong integration database")
   assert.call(postgres.fetch("ports") == ["55432:5432"], "wrong integration port")
   assert.call(postgres.fetch("options").include?("pg_isready -U postgres -d dadamjang_test"), "missing health check")

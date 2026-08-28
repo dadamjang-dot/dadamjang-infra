@@ -4,7 +4,7 @@
 
 ## 구성
 
-- local: PostgreSQL 16, Redis 7, MinIO, Mailpit
+- local: PostgreSQL 16, Redis 7, Silo(MinIO 호환 S3), Mailpit
 - staging: AWS VPC, ALB, ECS Fargate API, RDS PostgreSQL, ElastiCache Redis, ECR, Secrets Manager, CloudWatch
 - e2e: staging과 분리된 AWS VPC, `dadamjang_e2e` RDS PostgreSQL, Redis, ECS Fargate API, ECR, Secrets Manager, HTTPS ALB
 - image: Cloudflare R2 원본 저장 + Cloudflare Images 변환. AWS S3와 CloudFront는 사용하지 않는다.
@@ -22,12 +22,14 @@ docker compose ps
 | --- | --- | --- |
 | PostgreSQL | `localhost:5432` | 애플리케이션 DB |
 | Redis | `localhost:6379` | 캐시·세션·큐 개발용 |
-| MinIO API | `http://localhost:9000` | S3 호환 로컬 이미지 저장소 |
-| MinIO Console | `http://localhost:9001` | MinIO 관리 UI |
+| Silo S3 API | `http://localhost:9000` | MinIO 호환 로컬 이미지 저장소 |
+| Silo Console | `http://localhost:9001` | 로컬 오브젝트 저장소 관리 UI |
 | Mailpit SMTP | `localhost:1025` | 로컬 메일 수신 |
 | Mailpit UI | `http://localhost:8025` | 수신 메일 확인 |
 
 종료는 `docker compose down`, 데이터까지 삭제하려면 `docker compose down -v`를 사용한다.
+
+루트 Compose는 README의 표준 로컬 부트스트랩이며 CI가 구성을 검증하므로 모든 서비스 이미지를 검토된 버전과 멀티 아키텍처 manifest digest로 고정한다. 기존 MinIO Community 컨테이너는 [유지보수가 종료](https://github.com/minio/minio#readme)되어 S3 API, `MINIO_*` 설정, 라우트, 디스크 형식을 유지하는 [Silo 2026-08-06](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-06T00-00-00Z)으로 교체했다. 기존 `minio-data`가 필요하면 최초 Silo 실행 전에 백업하고, 폐기 가능한 로컬 데이터라면 `docker compose down -v`로 새 볼륨에서 시작한다.
 
 BE 로컬 환경은 `POSTGRES_HOST=localhost`, `POSTGRES_PORT=5432`, `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=postgres`, `POSTGRES_DATABASE=dadamjang`을 사용한다. Mailpit은 `localhost:1025` SMTP로 연결한다.
 
