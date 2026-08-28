@@ -227,7 +227,7 @@ resource "aws_ecs_cluster" "main" {
 
 resource "aws_ecs_task_definition" "api" {
   container_definitions = jsonencode([{
-    command = ["node", "dist/main.js"]
+    command = ["node", "dist/src/main.js"]
     environment = [
       { name = "NODE_ENV", value = "e2e" },
       { name = "POSTGRES_DATABASE", value = local.database_name },

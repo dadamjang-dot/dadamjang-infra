@@ -3,17 +3,23 @@ name: infra ci
 on:
   pull_request:
     paths:
+      - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "docker/**"
       - "docker-compose.yml"
       - "terraform/**"
+      - "tests/**"
   push:
     branches: [main]
     paths:
+      - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "docker/**"
       - "docker-compose.yml"
       - "terraform/**"
+      - "tests/**"
 
 permissions:
   contents: read
@@ -26,6 +32,8 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - name: Validate Docker Compose
         run: docker compose --env-file .env.example config --quiet
+      - name: Guard release contracts
+        run: bash tests/release-contracts.sh
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive terraform
       - name: Guard e2e isolation and scale-down contract

@@ -18,6 +18,20 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dadamjang_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dadamjang_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
     env:
       BACKEND_REF: ${{ github.event.client_payload.ref || inputs.backend_ref || 'main' }}
     steps:
@@ -69,6 +83,9 @@ jobs:
           repository: dadamjang-dot/dadamjang-be
           ref: ${{ env.BACKEND_REF }}
           path: backend
+      - name: Resolve backend image tag
+        id: backend-commit
+        run: echo "sha=$(git -C backend rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
@@ -78,13 +95,13 @@ jobs:
       - name: Build and push immutable image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: ${{ steps.backend-commit.outputs.sha }}
         run: |
           docker build --file infra/docker/backend.Dockerfile --tag "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" backend
           docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
       - name: Run database migrations
         env:
-          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          IMAGE: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.backend-commit.outputs.sha }}
         run: |
           network_config=$(aws ecs describe-services --cluster "$AWS_ECS_CLUSTER" --service "$AWS_ECS_SERVICE" --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
           subnets=$(echo "$network_config" | jq -r '.subnets | join(",")')
@@ -109,7 +126,7 @@ jobs:
         with:
           task-definition: task-definition.json
           container-name: api
-          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.backend-commit.outputs.sha }}
       - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-definition.outputs.task-definition }}

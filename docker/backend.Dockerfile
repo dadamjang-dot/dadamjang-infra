@@ -8,9 +8,7 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN pnpm build && \
-    pnpm exec tsc scripts/migrate.ts --outDir dist/scripts --module commonjs --target es2021 --esModuleInterop true && \
-    pnpm prune --prod
+RUN pnpm build && pnpm prune --prod
 
 FROM node:22-alpine AS runtime
 
@@ -27,4 +25,4 @@ USER node
 
 EXPOSE 5500
 
-CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/main"]
+CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]
