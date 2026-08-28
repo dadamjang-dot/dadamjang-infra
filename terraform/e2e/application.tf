@@ -174,8 +174,8 @@ resource "aws_lb_target_group" "api" {
   health_check {
     healthy_threshold   = 2
     interval            = 30
-    matcher             = "200-499"
-    path                = "/graphql"
+    matcher             = "200"
+    path                = "/health/ready"
     timeout             = 5
     unhealthy_threshold = 3
   }
@@ -233,8 +233,12 @@ resource "aws_ecs_task_definition" "api" {
       { name = "POSTGRES_DATABASE", value = local.database_name },
       { name = "POSTGRES_HOST", value = aws_db_instance.main.address },
       { name = "POSTGRES_PORT", value = "5432" },
+      { name = "POSTGRES_SSL", value = "true" },
+      { name = "POSTGRES_SSL_CA_PATH", value = "/etc/ssl/certs/aws-rds-global-bundle.pem" },
       { name = "POSTGRES_USERNAME", value = var.database_username },
       { name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379" },
+      { name = "SENTRY_ENVIRONMENT", value = "e2e" },
+      { name = "SENTRY_RELEASE", value = var.api_image_tag },
       { name = "TRUST_PROXY", value = "true" },
     ]
     essential = true

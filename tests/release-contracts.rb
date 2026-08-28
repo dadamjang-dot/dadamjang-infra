@@ -33,7 +33,64 @@ step_named = lambda do |job, name|
 end
 
 active_hcl = lambda do |path|
-  File.read(File.join(root, path)).gsub(%r{/\*.*?\*/}m, "").gsub(%r{//.*$}, "").gsub(/#.*$/, "")
+  File.read(File.join(root, path))
+    .gsub(%r{/\*.*?\*/}m, "")
+    .lines
+    .reject { |line| line.match?(%r{^\s*(?:#|//)}) }
+    .join
+end
+
+hcl_block_from = lambda do |source, pattern|
+  match = source.match(pattern) || raise("missing HCL block #{pattern.inspect}")
+  opening = source.index("{", match.end(0)) || raise("missing opening brace for #{pattern.inspect}")
+  depth = 0
+  escaped = false
+  in_string = false
+  result = nil
+
+  source[opening..].each_char.with_index do |character, index|
+    if in_string
+      if escaped
+        escaped = false
+      elsif character == "\\"
+        escaped = true
+      elsif character == '"'
+        in_string = false
+      end
+      next
+    end
+
+    case character
+    when '"'
+      in_string = true
+    when "{"
+      depth += 1
+    when "}"
+      depth -= 1
+      if depth.zero?
+        result = source[opening..(opening + index)]
+        break
+      end
+    end
+  end
+
+  result || raise("missing closing brace for #{pattern.inspect}")
+end
+
+hcl_block = lambda do |path, pattern|
+  hcl_block_from.call(active_hcl.call(path), pattern)
+end
+
+hcl_arguments = lambda do |block|
+  block.scan(/^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$/).to_h
+end
+
+task_environment = lambda do |path|
+  task = hcl_block.call(path, /resource\s+"aws_ecs_task_definition"\s+"api"/)
+  environment = task[/environment\s*=\s*\[(.*?)\]\s*essential/m, 1] || raise("missing task environment")
+  environment.scan(/\{\s*name\s*=\s*"([A-Z0-9_]+)"\s*,\s*value\s*=\s*([^}\n]+)\}/).to_h do |name, value|
+    [name, value.strip]
+  end
 end
 
 runtime_keys = lambda do |path|
@@ -55,6 +112,23 @@ check.call("Docker build and runtime use backend build outputs") do
     instructions.include?('CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]'),
     "runtime command does not use emitted paths",
   )
+end
+
+check.call("Docker runtime ships the checksum-verified AWS RDS CA bundle") do
+  instructions = File.readlines(File.join(root, "docker/backend.Dockerfile"), chomp: true)
+    .map(&:strip)
+    .reject { |line| line.empty? || line.start_with?("#") }
+  stages = instructions.slice_before { |line| line.match?(/\AFROM\s/i) }.to_a
+  runtime_stage = stages.last.join("\n")
+  bundle_url = "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
+  bundle_checksum = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+  bundle_path = "/etc/ssl/certs/aws-rds-global-bundle.pem"
+  download_stage = stages[0...-1].find { |stage| stage.join("\n").include?(bundle_url) }
+
+  assert.call(download_stage, "build stages do not fetch the official AWS RDS global bundle")
+  assert.call(download_stage.join("\n").include?(bundle_checksum), "AWS RDS bundle checksum is not verified")
+  assert.call(runtime_stage.include?(bundle_path), "runtime image does not contain the AWS RDS bundle path")
+  assert.call(!runtime_stage.match?(/\b(?:curl|wget)\b|\bapk\s+add\b/), "runtime stage installs download tooling")
 end
 
 check.call("e2e task starts the emitted backend entrypoint") do
@@ -145,6 +219,13 @@ check.call("deploy consumes only the tested release identity") do
   render = render_steps.first
   expected_image = "${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.test.outputs.image_tag }}"
   assert.call(render.dig("with", "image") == expected_image, "rendered image is not the tested image")
+  release_environment = render.dig("with", "environment-variables").to_s.lines(chomp: true).to_h do |line|
+    line.split("=", 2)
+  end
+  assert.call(
+    release_environment["SENTRY_RELEASE"] == "${{ needs.test.outputs.image_tag }}",
+    "deployed Sentry release is not the tested immutable image tag",
+  )
 end
 
 check.call("image publication safely reuses immutable ECR tags") do
@@ -310,10 +391,102 @@ check.call("staging and e2e inject the shared backend runtime contract") do
     IDENTITY_INICIS_CALLBACK_BASE_URL
     IDENTITY_INICIS_MID
     IDENTITY_INICIS_SEED_IV
+    SENTRY_DSN
   ])
-  %w[terraform/staging/locals.tf terraform/e2e/locals.tf].each do |path|
+  paths = %w[terraform/staging/locals.tf terraform/e2e/locals.tf]
+  paths.each do |path|
     missing = required - runtime_keys.call(path)
     assert.call(missing.empty?, "#{path} misses #{missing.to_a.sort.join(", ")}")
+  end
+  assert.call(runtime_keys.call(paths[0]) == runtime_keys.call(paths[1]), "staging and e2e secret key contracts diverge")
+end
+
+check.call("staging and e2e tasks require verified PostgreSQL TLS and environment-specific Sentry metadata") do
+  expected = {
+    "terraform/staging/application.tf" => {
+      "POSTGRES_SSL" => '"true"',
+      "POSTGRES_SSL_CA_PATH" => '"/etc/ssl/certs/aws-rds-global-bundle.pem"',
+      "SENTRY_ENVIRONMENT" => '"staging"',
+      "SENTRY_RELEASE" => "var.api_image_tag",
+    },
+    "terraform/e2e/application.tf" => {
+      "POSTGRES_SSL" => '"true"',
+      "POSTGRES_SSL_CA_PATH" => '"/etc/ssl/certs/aws-rds-global-bundle.pem"',
+      "SENTRY_ENVIRONMENT" => '"e2e"',
+      "SENTRY_RELEASE" => "var.api_image_tag",
+    },
+  }
+
+  expected.each do |path, required_environment|
+    actual_environment = task_environment.call(path)
+    required_environment.each do |name, value|
+      assert.call(actual_environment[name] == value, "#{path} has wrong #{name}")
+    end
+  end
+end
+
+check.call("staging and e2e ALBs use the exact readiness contract") do
+  %w[terraform/staging/application.tf terraform/e2e/application.tf].each do |path|
+    target_group = hcl_block.call(path, /resource\s+"aws_lb_target_group"\s+"api"/)
+    health_check = hcl_block_from.call(target_group, /health_check/)
+    arguments = hcl_arguments.call(health_check)
+    assert.call(arguments["path"] == '"/health/ready"', "#{path} does not use the readiness endpoint")
+    assert.call(arguments["matcher"] == '"200"', "#{path} accepts non-200 health responses")
+  end
+end
+
+check.call("staging RDS deletion protection and final snapshot policy are independently safe") do
+  variables = {
+    "enable_deletion_protection" => "true",
+    "skip_final_snapshot" => "false",
+    "final_snapshot_identifier" => "null",
+  }
+  variables.each do |name, default|
+    block = hcl_block.call("terraform/staging/variables.tf", /variable\s+"#{name}"/)
+    assert.call(hcl_arguments.call(block)["default"] == default, "#{name} has unsafe default")
+  end
+
+  database = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_db_instance"\s+"main"/)
+  arguments = hcl_arguments.call(database)
+  assert.call(arguments["deletion_protection"] == "var.enable_deletion_protection", "RDS deletion protection is not independently configured")
+  assert.call(arguments["skip_final_snapshot"] == "var.skip_final_snapshot", "RDS final snapshot policy remains coupled to deletion protection")
+  final_identifier = arguments.fetch("final_snapshot_identifier")
+  assert.call(final_identifier.include?("var.skip_final_snapshot ? null :"), "final snapshot identifier is not null only when skipping")
+  assert.call(final_identifier.include?("var.final_snapshot_identifier"), "final snapshot identifier cannot be overridden")
+
+  e2e_database = hcl_block.call("terraform/e2e/application.tf", /resource\s+"aws_db_instance"\s+"main"/)
+  e2e_arguments = hcl_arguments.call(e2e_database)
+  assert.call(e2e_arguments["deletion_protection"] == "false", "e2e database is no longer disposable")
+  assert.call(e2e_arguments["skip_final_snapshot"] == "true", "e2e database now requires final snapshots")
+end
+
+check.call("staging alarms notify optional actions and cover ALB and target health failures") do
+  actions_variable = hcl_block.call("terraform/staging/variables.tf", /variable\s+"alarm_action_arns"/)
+  assert.call(hcl_arguments.call(actions_variable)["default"] == "[]", "alarm actions are not optional by default")
+
+  expected_metrics = {
+    "api_cpu" => "CPUUtilization",
+    "api_memory" => "MemoryUtilization",
+    "api_alb_5xx" => "HTTPCode_ELB_5XX_Count",
+    "api_unhealthy_hosts" => "UnHealthyHostCount",
+    "api_zero_healthy_hosts" => "HealthyHostCount",
+  }
+  expected_metrics.each do |name, metric|
+    alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"#{name}"/)
+    arguments = hcl_arguments.call(alarm)
+    assert.call(arguments["metric_name"] == "\"#{metric}\"", "#{name} uses the wrong metric")
+    assert.call(arguments["alarm_actions"] == "var.alarm_action_arns", "#{name} does not use optional alarm actions")
+  end
+
+  alb_alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"api_alb_5xx"/)
+  alb_dimensions = hcl_arguments.call(hcl_block_from.call(alb_alarm, /dimensions\s*=/))
+  assert.call(alb_dimensions == { "LoadBalancer" => "aws_lb.api.arn_suffix" }, "ALB 5xx alarm dimensions are wrong")
+
+  %w[api_unhealthy_hosts api_zero_healthy_hosts].each do |name|
+    alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"#{name}"/)
+    dimensions = hcl_arguments.call(hcl_block_from.call(alarm, /dimensions\s*=/))
+    assert.call(dimensions["LoadBalancer"] == "aws_lb.api.arn_suffix", "#{name} misses the ALB dimension")
+    assert.call(dimensions["TargetGroup"] == "aws_lb_target_group.api.arn_suffix", "#{name} misses the target group dimension")
   end
 end
 
@@ -329,6 +502,15 @@ check.call("README documents the staging rollout contract") do
     readme.include?("backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>"),
     "README lacks immutable image provenance",
   )
+  transform_base = JSON.parse(secret_json).fetch("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL")
+  assert.call(transform_base.start_with?("https://"), "Cloudflare transform base is not HTTPS")
+  assert.call(transform_base.end_with?("/cdn-cgi/image"), "Cloudflare transform base is not a zone image transform path")
+  assert.call(readme.include?("/etc/ssl/certs/aws-rds-global-bundle.pem"), "README lacks the RDS TLS CA path")
+  assert.call(readme.include?("alarm_action_arns") && readme.include?("SNS topic ARN"), "README lacks the alarm SNS prerequisite")
+  assert.call(readme.include?("skip_final_snapshot"), "README lacks the final snapshot switch")
+  assert.call(readme.include?("final_snapshot_identifier"), "README lacks the final snapshot identifier override")
+  assert.call(readme.include?("aws rds delete-db-snapshot"), "README lacks snapshot collision cleanup guidance")
+  assert.call(readme.include?("/health/ready"), "README lacks the readiness rollout prerequisite")
 end
 
 exit(failures.empty? ? 0 : 1)

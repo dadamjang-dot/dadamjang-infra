@@ -58,7 +58,21 @@ workspaces {
 
 첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
-ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `200-499`를 정상으로 취급한다. BE에 전용 `200` health endpoint가 생기면 matcher를 `200`으로 좁혀야 한다.
+ALB health check는 인증 없이 정확히 `200`을 반환하는 backend readiness endpoint `/health/ready`를 사용한다. rollout 전에 배포 대상 backend commit이 이 endpoint를 제공하는지 확인한다.
+
+ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다.
+
+### staging RDS safe destroy
+
+staging RDS는 기본적으로 `enable_deletion_protection=true`, `skip_final_snapshot=false`다. 삭제가 필요하면 먼저 deletion protection만 `false`로 apply하고, final snapshot을 남긴 채 destroy한다. `final_snapshot_identifier`를 지정하지 않으면 `dadamjang-staging-postgres-final`을 사용한다.
+
+같은 identifier의 snapshot이 이미 있으면 destroy가 실패한다. 보관할 snapshot에는 고유한 `final_snapshot_identifier` override를 지정한다. 기존 snapshot이 불필요함을 확인한 경우에만 다음 명령으로 수동 삭제한 뒤 다시 destroy한다.
+
+```bash
+aws rds delete-db-snapshot --db-snapshot-identifier dadamjang-staging-postgres-final
+```
+
+final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot=true`를 사용한다. e2e RDS는 테스트용 disposable 환경이라 deletion protection 없이 final snapshot을 건너뛴다.
 
 ## AWS 사전 준비
 
@@ -78,6 +92,8 @@ ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `20
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
 
 API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform apply와 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
+
+CloudWatch alarm 알림을 사용하려면 먼저 SNS topic과 subscription을 별도로 만들고 SNS topic ARN을 Terraform의 `alarm_action_arns`에 전달한다. 기본값은 빈 set이며 이 root는 SNS resource를 만들지 않는다.
 
 현재 `staging` Environment variables는 아래 기본 naming으로 등록되어 있다.
 
@@ -125,11 +141,19 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
   "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "replace-me",
   "CLOUDFLARE_R2_BUCKET": "dadamjang-staging",
   "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://images.example.com",
-  "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://imagedelivery.net/<account-hash>"
+  "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://images.example.com/cdn-cgi/image",
+  "SENTRY_DSN": "https://<public-key>@<sentry-host>/<project-id>"
 }
 ```
 
 새 task definition을 등록하기 전에 위 JSON의 모든 key를 실제 값으로 새 secret version에 등록해야 한다. Terraform은 JSON 값이 아니라 key별 ECS 참조만 추가하므로, 누락된 key가 있으면 새 task가 시작되지 않는다. OIDC trust 변경을 먼저 Terraform apply한 뒤 API deploy를 실행한다.
+
+rollout 전에는 다음 조건을 모두 충족한다.
+
+- 배포 대상 backend가 `/health/ready`에서 인증 없이 `200`을 반환한다.
+- staging과 e2e Secrets Manager JSON에 `SENTRY_DSN`을 포함한 `local.runtime_secret_keys`의 exact key set과 실제 값을 등록한다.
+- 새 task environment, secret reference, alarm 설정을 Terraform apply한 뒤 immutable image deploy를 실행한다.
+- alarm 알림을 켤 경우 `alarm_action_arns`가 가리키는 SNS topic ARN과 subscription을 미리 만든다.
 
 예시 JSON을 실제 값으로 저장한 뒤 다음처럼 등록한다.
 

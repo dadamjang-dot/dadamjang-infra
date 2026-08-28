@@ -32,5 +32,6 @@ locals {
     "KAKAO_CLIENT_ID",
     "RESEND_API_KEY",
     "RESEND_FROM_EMAIL",
+    "SENTRY_DSN",
   ])
 }

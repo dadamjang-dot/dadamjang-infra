@@ -31,5 +31,6 @@ locals {
     "CLIENT_URL",
     "RESEND_API_KEY",
     "RESEND_FROM_EMAIL",
+    "SENTRY_DSN",
   ])
 }

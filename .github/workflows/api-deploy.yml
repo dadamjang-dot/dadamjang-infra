@@ -117,6 +117,8 @@ jobs:
           task-definition: task-definition.json
           container-name: api
           image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.test.outputs.image_tag }}
+          environment-variables: |
+            SENTRY_RELEASE=${{ needs.test.outputs.image_tag }}
       - uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         id: register-task-definition
         with:
