@@ -6,8 +6,10 @@ on:
       - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "README.md"
       - "docker/**"
       - "docker-compose.yml"
+      - "scripts/**"
       - "terraform/**"
       - "tests/**"
   push:
@@ -16,8 +18,10 @@ on:
       - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "README.md"
       - "docker/**"
       - "docker-compose.yml"
+      - "scripts/**"
       - "terraform/**"
       - "tests/**"
 

@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: staging-api-deploy
-      cancel-in-progress: true
+      cancel-in-progress: false
     environment:
       name: staging
     env:

@@ -9,6 +9,8 @@ require "yaml"
 
 root = File.expand_path("..", __dir__)
 workflow = YAML.load_file(File.join(root, ".github/workflows/api-deploy.yml"))
+infra_ci = YAML.load_file(File.join(root, ".github/workflows/infra-ci.yml"))
+infra_ci_triggers = infra_ci["on"] || infra_ci.fetch(true)
 jobs = workflow.fetch("jobs")
 test_job = jobs.fetch("test")
 deploy_job = jobs.fetch("deploy")
@@ -60,6 +62,15 @@ check.call("e2e task starts the emitted backend entrypoint") do
   assert.call(application.include?('command = ["node", "dist/src/main.js"]'), "wrong e2e entrypoint")
 end
 
+check.call("infra CI watches release behavior and documentation") do
+  required_paths = Set.new(["README.md", "scripts/**"])
+  %w[pull_request push].each do |event|
+    configured_paths = infra_ci_triggers.fetch(event).fetch("paths").to_set
+    missing_paths = required_paths - configured_paths
+    assert.call(missing_paths.empty?, "#{event} omits #{missing_paths.to_a.join(", ")}")
+  end
+end
+
 check.call("test job owns the PostgreSQL integration service") do
   postgres = test_job.fetch("services").fetch("postgres")
   assert.call(postgres.fetch("image") == "postgres:16-alpine", "wrong PostgreSQL image")
@@ -109,7 +120,7 @@ end
 
 check.call("deploy consumes only the tested release identity") do
   assert.call(deploy_job.fetch("needs") == "test", "deploy does not depend on test")
-  assert.call(deploy_job.fetch("concurrency") == { "group" => "staging-api-deploy", "cancel-in-progress" => true }, "deploy is not serialized")
+  assert.call(deploy_job.fetch("concurrency") == { "group" => "staging-api-deploy", "cancel-in-progress" => false }, "deploy can be canceled mid-release")
   assert.call(deploy_job.dig("environment", "name") == "staging", "staging approval is missing")
   backend_checkouts = deploy_job.fetch("steps").select do |step|
     step["uses"] == "actions/checkout@v4" && step.dig("with", "repository") == "dadamjang-dot/dadamjang-be"
@@ -209,7 +220,21 @@ check.call("migration and service deploy use one registered task definition") do
       printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
       case "$1 $2" in
         "ecs describe-services")
-          printf '%s\n' '{"subnets":["subnet-0123456789abcdef0"],"securityGroups":["sg-0123456789abcdef0"],"assignPublicIp":"DISABLED"}'
+          if [[ "$*" == *"networkConfiguration.awsvpcConfiguration"* ]]; then
+            printf '%s\n' '{"subnets":["subnet-0123456789abcdef0"],"securityGroups":["sg-0123456789abcdef0"],"assignPublicIp":"DISABLED"}'
+          elif [[ "$*" == *'--query services[0].deployments[?status==`PRIMARY`].{taskDefinition:taskDefinition,rolloutState:rolloutState}'* ]]; then
+            case "$FAKE_SERVICE_DEPLOYMENT" in
+              success) printf '[{"taskDefinition":"%s","rolloutState":"COMPLETED"}]\n' "$TASK_DEFINITION_ARN" ;;
+              rollback) printf '%s\n' '[{"taskDefinition":"arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:41","rolloutState":"COMPLETED"}]' ;;
+              incomplete) printf '[{"taskDefinition":"%s","rolloutState":"IN_PROGRESS"}]\n' "$TASK_DEFINITION_ARN" ;;
+              missing) printf '%s\n' '[]' ;;
+              multiple) printf '[{"taskDefinition":"%s","rolloutState":"COMPLETED"},{"taskDefinition":"arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:41","rolloutState":"COMPLETED"}]\n' "$TASK_DEFINITION_ARN" ;;
+              error) printf '%s\n' 'AccessDeniedException: denied' >&2; exit 255 ;;
+              *) exit 3 ;;
+            esac
+          else
+            exit 3
+          fi
           ;;
         "ecs run-task")
           shift 2
@@ -236,7 +261,8 @@ check.call("migration and service deploy use one registered task definition") do
       "AWS_ECS_SERVICE" => "staging-service",
       "TASK_DEFINITION_ARN" => task_definition_arn,
     }
-    _, stderr, status = Open3.capture3(env, "bash", File.join(root, "scripts/deploy-ecs-release.sh"), chdir: root)
+    command = ["bash", File.join(root, "scripts/deploy-ecs-release.sh")]
+    _, stderr, status = Open3.capture3(env.merge("FAKE_SERVICE_DEPLOYMENT" => "success"), *command, chdir: root)
     assert.call(status.success?, stderr)
     payload = JSON.parse(File.read(run_task_input))
     assert.call(payload.fetch("taskDefinition") == task_definition_arn, "migration uses another task definition")
@@ -251,11 +277,20 @@ check.call("migration and service deploy use one registered task definition") do
     assert.call(validation_status.success?, validation_error)
 
     calls = File.readlines(aws_log, chomp: true)
+    failure_results = %w[rollback incomplete missing multiple error].to_h do |scenario|
+      FileUtils.rm_f(aws_log)
+      _, _, scenario_status = Open3.capture3(env.merge("FAKE_SERVICE_DEPLOYMENT" => scenario), *command, chdir: root)
+      [scenario, scenario_status.success?]
+    end
     run_index = calls.index { |call| call.start_with?("ecs run-task ") } || raise("run-task was not called")
     update_index = calls.index { |call| call.start_with?("ecs update-service ") } || raise("update-service was not called")
+    wait_index = calls.index { |call| call == "ecs wait services-stable --cluster staging-cluster --services staging-service" } || raise("service stability is not awaited")
     assert.call(run_index < update_index, "service updates before migration")
     assert.call(calls[update_index].include?("--task-definition #{task_definition_arn}"), "service uses another task definition")
-    assert.call(calls.last == "ecs wait services-stable --cluster staging-cluster --services staging-service", "service stability is not awaited")
+    assert.call(wait_index < calls.length - 1, "service deployment is not inspected after the waiter")
+
+    accepted_failures = failure_results.select { |_, succeeded| succeeded }.keys
+    assert.call(accepted_failures.empty?, "deployment verification accepted #{accepted_failures.join(", ")}")
   end
 end
 
