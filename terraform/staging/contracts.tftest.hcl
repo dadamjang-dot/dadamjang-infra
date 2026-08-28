@@ -239,11 +239,11 @@ run "alarm_action_override" {
 
   assert {
     condition = alltrue([
-      toset(aws_cloudwatch_metric_alarm.api_cpu.alarm_actions) == var.alarm_action_arns,
-      toset(aws_cloudwatch_metric_alarm.api_memory.alarm_actions) == var.alarm_action_arns,
-      toset(aws_cloudwatch_metric_alarm.api_alb_5xx.alarm_actions) == var.alarm_action_arns,
-      toset(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.alarm_actions) == var.alarm_action_arns,
-      toset(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.alarm_actions) == var.alarm_action_arns,
+      toset(aws_cloudwatch_metric_alarm.api_cpu.alarm_actions) == toset(var.alarm_action_arns),
+      toset(aws_cloudwatch_metric_alarm.api_memory.alarm_actions) == toset(var.alarm_action_arns),
+      toset(aws_cloudwatch_metric_alarm.api_alb_5xx.alarm_actions) == toset(var.alarm_action_arns),
+      toset(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.alarm_actions) == toset(var.alarm_action_arns),
+      toset(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.alarm_actions) == toset(var.alarm_action_arns),
     ])
     error_message = "Every staging alarm must receive a non-empty alarm action override."
   }
