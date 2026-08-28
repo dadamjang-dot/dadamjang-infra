@@ -309,6 +309,40 @@ check.call("Terraform backend contracts exclude unsupported execution settings")
   end
 end
 
+check.call("HCP Terraform credentials stay outside backend configuration and plans") do
+  hcp_token_secret = "${{ secrets.HCP_TERRAFORM_TOKEN }}"
+  terraform_jobs = {
+    ".github/workflows/api-deploy.yml" => deploy_job,
+    ".github/workflows/terraform-apply.yml" => terraform_apply.fetch("jobs").fetch("terraform"),
+  }
+
+  terraform_jobs.each do |path, job|
+    setup_steps = job.fetch("steps").select { |step| uses_action.call(step, "hashicorp/setup-terraform") }
+    assert.call(setup_steps.length == 1, "#{path} must have exactly one Terraform setup step")
+    setup_token = setup_steps.first.dig("with", "cli_config_credentials_token")
+    assert.call(setup_token == hcp_token_secret, "#{path} does not inject the protected HCP token through Terraform CLI credentials")
+    token_references = JSON.generate(job).scan(hcp_token_secret).length
+    assert.call(token_references == 1, "#{path} exposes the HCP token outside the Terraform CLI credential input")
+
+    backend_step = step_named.call(job, "Write Terraform backend configuration")
+    backend_env = job.fetch("env", {}).merge(backend_step.fetch("env", {}))
+    backend_metadata = backend_env.fetch("TF_BACKEND_CONFIG")
+    assert.call(backend_metadata == "${{ secrets.TF_BACKEND_CONFIG }}", "#{path} does not keep backend metadata in its dedicated protected input")
+    assert.call(!backend_step.fetch("run").include?("HCP_TERRAFORM_TOKEN"), "#{path} writes the HCP token into backend.hcl")
+    run_commands = job.fetch("steps").map { |step| step["run"] }.compact.join("\n")
+    assert.call(!run_commands.include?("HCP_TERRAFORM_TOKEN"), "#{path} exposes the HCP token to a shell command")
+  end
+
+  terraform_job = terraform_jobs.fetch(".github/workflows/terraform-apply.yml")
+  uploads_artifact = terraform_job.fetch("steps").any? { |step| uses_action.call(step, "actions/upload-artifact") }
+  assert.call(!uploads_artifact, "Terraform workflow uploads a plan artifact that could retain backend data")
+
+  readme = File.read(File.join(root, "README.md"))
+  assert.call(readme.include?("`HCP_TERRAFORM_TOKEN`"), "README omits the protected HCP token")
+  assert.call(readme.include?("`cli_config_credentials_token`"), "README omits the CI credential injection mechanism")
+  assert.call(readme.include?("`terraform login app.terraform.io`"), "README omits separate local HCP authentication")
+end
+
 check.call("Terraform apply detection handles CLI global options") do
   assert.call(
     terraform_apply_command.call("terraform -chdir=terraform/staging apply -input=false staging.tfplan"),

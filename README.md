@@ -45,6 +45,7 @@ terraform validate
 로컬 plan은 GitHub `staging` Environment와 같은 보호 값을 환경 변수로 주입하고 원격 state를 선택한다.
 
 ```bash
+terraform login app.terraform.io
 export TF_VAR_acm_certificate_arn="arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
 export TF_VAR_api_hostname="api.staging.example.com"
 terraform init -reconfigure -backend-config=backend.hcl
@@ -53,7 +54,7 @@ terraform plan -input=false
 
 CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. Apply 자동화는 아직 제공하지 않는다. 향후 apply는 동일한 저장 plan을 별도 보호 승인 뒤 소비하는 계약으로 구현하거나, 그 전까지는 plan 생성·검토·apply를 하나의 통제된 out-of-band 수동 절차에서 수행한다.
 
-상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 또는 조직의 기존 원격 backend를 권장한다. `TF_BACKEND_CONFIG` GitHub Environment secret에 backend 설정을 HCL로 넣는다.
+상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 원격 backend를 사용한다. `TF_BACKEND_CONFIG` GitHub Environment secret에는 비자격증명 backend 설정만 HCL로 넣고, HCP 인증은 별도의 `HCP_TERRAFORM_TOKEN` Environment secret으로 제공한다.
 
 ```hcl
 # 예: HCP Terraform remote backend 설정
@@ -65,7 +66,7 @@ workspaces {
 }
 ```
 
-staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI는 보호된 `HCP_TERRAFORM_TOKEN`을 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달해 Terraform CLI credentials를 구성한다. 로컬에서는 `terraform login app.terraform.io`로 동일한 credentials를 별도로 구성한다. 토큰은 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
 첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
@@ -104,6 +105,7 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
+| `HCP_TERRAFORM_TOKEN` | Secret | Terraform CLI에서만 사용하는 HCP Terraform API token |
 
 API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform apply와 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
 
@@ -126,6 +128,7 @@ API_HOSTNAME=api.staging.example.com
 AWS_API_DEPLOY_ROLE_ARN
 AWS_TERRAFORM_ROLE_ARN
 TF_BACKEND_CONFIG
+HCP_TERRAFORM_TOKEN
 ```
 
 ## API runtime secrets
