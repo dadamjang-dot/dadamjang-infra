@@ -60,7 +60,9 @@ workspaces {
 
 ALB health check는 인증 없이 정확히 `200`을 반환하는 backend readiness endpoint `/health/ready`를 사용한다. rollout 전에 배포 대상 backend commit이 이 endpoint를 제공하는지 확인한다.
 
-ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다.
+ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다. 현재 공식 URL은 `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`, 새로 검증한 SHA-256은 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`이다.
+
+상류 AWS bundle이 교체되면 digest도 바뀌므로 image build는 의도적으로 즉시 실패(fail closed)한다. Pin을 안전하게 갱신하려면 위 공식 URL에서만 bundle을 내려받고, `sha256sum`으로 새 SHA-256을 독립적으로 계산한 뒤 AWS가 공개한 인증서 출처 및 인증서 내용과 대조한다. Bundle과 digest 변경을 검토한 후에만 `docker/backend.Dockerfile`의 pin을 갱신한다.
 
 ### staging RDS safe destroy
 

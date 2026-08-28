@@ -122,13 +122,28 @@ check.call("Docker runtime ships the checksum-verified AWS RDS CA bundle") do
   runtime_stage = stages.last.join("\n")
   bundle_url = "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
   bundle_checksum = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
-  bundle_path = "/etc/ssl/certs/aws-rds-global-bundle.pem"
+  build_bundle_path = "/tmp/aws-rds-global-bundle.pem"
+  runtime_bundle_path = "/etc/ssl/certs/aws-rds-global-bundle.pem"
   download_stage = stages[0...-1].find { |stage| stage.join("\n").include?(bundle_url) }
 
   assert.call(download_stage, "build stages do not fetch the official AWS RDS global bundle")
-  assert.call(download_stage.join("\n").include?(bundle_checksum), "AWS RDS bundle checksum is not verified")
-  assert.call(runtime_stage.include?(bundle_path), "runtime image does not contain the AWS RDS bundle path")
+  build_stage = download_stage.join("\n").gsub(/ ?\\\n\s*/, " ")
+  download_command = "curl --fail --silent --show-error #{bundle_url} --output #{build_bundle_path}"
+  checksum_command = %(echo "#{bundle_checksum}  #{build_bundle_path}" | sha256sum -c -)
+  copy_command = "COPY --from=build #{build_bundle_path} #{runtime_bundle_path}"
+  assert.call(build_stage.include?(download_command), "AWS RDS bundle is not downloaded from the exact official URL to the build-stage bundle")
+  assert.call(build_stage.include?(checksum_command), "AWS RDS build-stage bundle is not verified with the pinned checksum")
+  assert.call(runtime_stage.lines(chomp: true).include?(copy_command), "runtime image does not copy the verified build-stage AWS RDS bundle")
   assert.call(!runtime_stage.match?(/\b(?:curl|wget)\b|\bapk\s+add\b/), "runtime stage installs download tooling")
+
+  Dir.mktmpdir("aws-rds-bundle-checksum") do |directory|
+    rotated_bundle = File.join(directory, "aws-rds-global-bundle.pem")
+    checksum_manifest = File.join(directory, "sha256sum.txt")
+    File.write(rotated_bundle, "rotated AWS RDS bundle bytes\n")
+    File.write(checksum_manifest, "#{bundle_checksum}  #{rotated_bundle}\n")
+    _, _, status = Open3.capture3("sha256sum", "-c", checksum_manifest)
+    assert.call(!status.success?, "rotated AWS RDS bundle bytes passed the pinned checksum")
+  end
 end
 
 check.call("e2e task starts the emitted backend entrypoint") do
@@ -451,8 +466,9 @@ check.call("staging RDS deletion protection and final snapshot policy are indepe
   assert.call(arguments["deletion_protection"] == "var.enable_deletion_protection", "RDS deletion protection is not independently configured")
   assert.call(arguments["skip_final_snapshot"] == "var.skip_final_snapshot", "RDS final snapshot policy remains coupled to deletion protection")
   final_identifier = arguments.fetch("final_snapshot_identifier")
-  assert.call(final_identifier.include?("var.skip_final_snapshot ? null :"), "final snapshot identifier is not null only when skipping")
-  assert.call(final_identifier.include?("var.final_snapshot_identifier"), "final snapshot identifier cannot be overridden")
+  expected_final_identifier = 'var.skip_final_snapshot ? null : coalesce(var.final_snapshot_identifier, "${local.name_prefix}-postgres-final")'
+  assert.call(final_identifier == expected_final_identifier, "final snapshot identifier does not use the exact deterministic fallback")
+  assert.call(!final_identifier.match?(/\b(?:timestamp|plantimestamp|uuid|uuidv5)\s*\(/), "final snapshot identifier uses nondeterministic generation")
 
   e2e_database = hcl_block.call("terraform/e2e/application.tf", /resource\s+"aws_db_instance"\s+"main"/)
   e2e_arguments = hcl_arguments.call(e2e_database)
@@ -506,6 +522,12 @@ check.call("README documents the staging rollout contract") do
   assert.call(transform_base.start_with?("https://"), "Cloudflare transform base is not HTTPS")
   assert.call(transform_base.end_with?("/cdn-cgi/image"), "Cloudflare transform base is not a zone image transform path")
   assert.call(readme.include?("/etc/ssl/certs/aws-rds-global-bundle.pem"), "README lacks the RDS TLS CA path")
+  assert.call(readme.include?("https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"), "README lacks the official AWS RDS bundle URL")
+  assert.call(readme.include?("e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"), "README lacks the current AWS RDS bundle checksum")
+  assert.call(readme.include?("fail closed"), "README lacks the fail-closed AWS RDS bundle rotation behavior")
+  assert.call(readme.include?("sha256sum"), "README lacks independent AWS RDS bundle checksum verification")
+  assert.call(readme.include?("인증서 출처"), "README lacks independent AWS RDS certificate source verification")
+  assert.call(readme.include?("검토"), "README lacks review before updating the AWS RDS checksum pin")
   assert.call(readme.include?("alarm_action_arns") && readme.include?("SNS topic ARN"), "README lacks the alarm SNS prerequisite")
   assert.call(readme.include?("skip_final_snapshot"), "README lacks the final snapshot switch")
   assert.call(readme.include?("final_snapshot_identifier"), "README lacks the final snapshot identifier override")
