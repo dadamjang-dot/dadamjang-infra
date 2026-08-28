@@ -66,6 +66,21 @@ run "release_contracts" {
   }
 
   assert {
+    condition = (
+      length(jsondecode(aws_ecr_lifecycle_policy.api.policy).rules) > 0 &&
+      alltrue([
+        for rule in jsondecode(aws_ecr_lifecycle_policy.api.policy).rules :
+        try(rule.action.type, null) == "expire" &&
+        try(rule.selection.tagStatus, null) == "untagged" &&
+        try(rule.selection.countType, null) == "sinceImagePushed" &&
+        try(rule.selection.countUnit, null) == "days" &&
+        try(rule.selection.countNumber, 0) > 0
+      ])
+    )
+    error_message = "E2E must expire only untagged images by age."
+  }
+
+  assert {
     condition = alltrue([
       one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "POSTGRES_SSL"]) == "true",
       one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "POSTGRES_SSL_CA_PATH"]) == "/etc/ssl/certs/aws-rds-global-bundle.pem",

@@ -112,12 +112,13 @@ resource "aws_ecr_lifecycle_policy" "api" {
       action = {
         type = "expire"
       }
-      description  = "Keep the 20 newest API images."
+      description  = "Expire untagged API images after 7 days."
       rulePriority = 1
       selection = {
-        countNumber = 20
-        countType   = "imageCountMoreThan"
-        tagStatus   = "any"
+        countNumber = 7
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        tagStatus   = "untagged"
       }
     }]
   })

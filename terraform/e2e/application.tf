@@ -94,12 +94,13 @@ resource "aws_ecr_lifecycle_policy" "api" {
   policy = jsonencode({
     rules = [{
       action       = { type = "expire" }
-      description  = "Keep the 10 newest e2e API images."
+      description  = "Expire untagged API images after 7 days."
       rulePriority = 1
       selection = {
-        countNumber = 10
-        countType   = "imageCountMoreThan"
-        tagStatus   = "any"
+        countNumber = 7
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        tagStatus   = "untagged"
       }
     }]
   })

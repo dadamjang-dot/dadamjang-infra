@@ -71,6 +71,21 @@ run "release_contracts" {
   }
 
   assert {
+    condition = (
+      length(jsondecode(aws_ecr_lifecycle_policy.api.policy).rules) > 0 &&
+      alltrue([
+        for rule in jsondecode(aws_ecr_lifecycle_policy.api.policy).rules :
+        try(rule.action.type, null) == "expire" &&
+        try(rule.selection.tagStatus, null) == "untagged" &&
+        try(rule.selection.countType, null) == "sinceImagePushed" &&
+        try(rule.selection.countUnit, null) == "days" &&
+        try(rule.selection.countNumber, 0) > 0
+      ])
+    )
+    error_message = "Staging must expire only untagged images by age."
+  }
+
+  assert {
     condition = output.ecs_release_contract.runtime_secret_names == sort(concat(
       ["POSTGRES_PASSWORD"],
       tolist(local.runtime_secret_keys),
