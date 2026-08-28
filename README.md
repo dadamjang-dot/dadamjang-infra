@@ -60,7 +60,7 @@ workspaces {
 
 ALB health check는 인증 없이 정확히 `200`을 반환하는 backend readiness endpoint `/health/ready`를 사용한다. rollout 전에 배포 대상 backend commit이 이 endpoint를 제공하는지 확인한다.
 
-ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다. 현재 공식 URL은 `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`, 새로 검증한 SHA-256은 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`이다.
+ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다. 현재 공식 URL은 `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`, 새로 검증한 SHA-256은 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`이다. Download에는 Node 내장 `fetch`를 사용하며 build 중 mutable Alpine package를 설치하지 않는다.
 
 상류 AWS bundle이 교체되면 digest도 바뀌므로 image build는 의도적으로 즉시 실패(fail closed)한다. Pin을 안전하게 갱신하려면 위 공식 URL에서만 bundle을 내려받고, `sha256sum`으로 새 SHA-256을 독립적으로 계산한 뒤 AWS가 공개한 인증서 출처 및 인증서 내용과 대조한다. Bundle과 digest 변경을 검토한 후에만 `docker/backend.Dockerfile`의 pin을 갱신한다.
 
@@ -88,7 +88,6 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_ECR_REPOSITORY` | Variable | `api_ecr_repository_url`의 repository 이름 부분 |
 | `AWS_ECS_CLUSTER` | Variable | `ecs_cluster_name` |
 | `AWS_ECS_SERVICE` | Variable | `ecs_service_name` |
-| `AWS_ECS_TASK_FAMILY` | Variable | `ecs_task_family` |
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
@@ -104,7 +103,6 @@ AWS_REGION=ap-northeast-2
 AWS_ECR_REPOSITORY=dadamjang-staging-api
 AWS_ECS_CLUSTER=dadamjang-staging-cluster
 AWS_ECS_SERVICE=dadamjang-staging-api
-AWS_ECS_TASK_FAMILY=dadamjang-staging-api
 ```
 
 아래 secrets는 실제 AWS 계정과 원격 Terraform backend 값이 있어야 등록할 수 있다.
@@ -173,7 +171,9 @@ Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public
 - `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 plan 또는 apply한다.
 - `api-deploy.yml`: `repository_dispatch` 타입 `backend-main` 또는 수동 실행으로 BE를 lint/test/build하고 ECR push, ECS deploy를 수행한다. deploy job은 `staging` Environment 승인을 요구한다.
 
-API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다.
+API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다. Node base는 공식 `linux/amd64` manifest digest로 고정하고 build와 Fargate runtime도 각각 `linux/amd64`, `X86_64`로 고정한다. Push 또는 tag 재사용 후 ECR에서 digest를 다시 조회해 `repository@sha256:...`만 task definition에 등록한다.
+
+배포는 ECS service가 현재 사용하는 task definition ARN을 먼저 읽는다. Terraform state의 `ecs_task_definition_arn`이 가리키는 reviewed definition과 image 및 `SENTRY_RELEASE`를 제외한 container/task runtime contract가 일치하고 PostgreSQL TLS 환경과 secret reference가 유효할 때만 현재 service definition에 새 image digest를 렌더링한다. 따라서 이 output을 추가하거나 runtime contract를 변경한 Terraform commit은 먼저 staging apply해야 한다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

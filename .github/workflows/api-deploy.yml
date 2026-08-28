@@ -85,7 +85,6 @@ jobs:
     env:
       AWS_ECS_CLUSTER: ${{ vars.AWS_ECS_CLUSTER }}
       AWS_ECS_SERVICE: ${{ vars.AWS_ECS_SERVICE }}
-      AWS_ECS_TASK_FAMILY: ${{ vars.AWS_ECS_TASK_FAMILY }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ROLE_ARN: ${{ secrets.AWS_API_DEPLOY_ROLE_ARN }}
       ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
@@ -104,19 +103,29 @@ jobs:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr-login
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
       - name: Build or reuse immutable image
+        id: image
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ needs.test.outputs.image_tag }}
-        run: bash infra/scripts/publish-backend-image.sh "$REGISTRY" "$ECR_REPOSITORY" "$IMAGE_TAG" infra/docker/backend.Dockerfile backend
-      - name: Read active ECS task definition
-        run: aws ecs describe-task-definition --task-definition "$AWS_ECS_TASK_FAMILY" --query taskDefinition > task-definition.json
+        run: bash infra/scripts/publish-backend-image.sh "$REGISTRY" "$ECR_REPOSITORY" "$IMAGE_TAG" infra/docker/backend.Dockerfile backend | sed 's/^/reference=/' >> "$GITHUB_OUTPUT"
+      - name: Write Terraform backend configuration
+        env:
+          TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
+        run: printf '%s' "$TF_BACKEND_CONFIG" > infra/terraform/staging/backend.hcl
+      - name: Initialize Terraform state backend
+        run: terraform -chdir=infra/terraform/staging init -input=false -backend-config=backend.hcl
+      - name: Read deployed ECS task definition
+        run: bash infra/scripts/prepare-ecs-task-definition.sh infra/terraform/staging task-definition.json
       - uses: aws-actions/amazon-ecs-render-task-definition@v1
         id: task-definition
         with:
           task-definition: task-definition.json
           container-name: api
-          image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.test.outputs.image_tag }}
+          image: ${{ steps.image.outputs.reference }}
           environment-variables: |
             SENTRY_RELEASE=${{ needs.test.outputs.image_tag }}
       - uses: aws-actions/amazon-ecs-deploy-task-definition@v2

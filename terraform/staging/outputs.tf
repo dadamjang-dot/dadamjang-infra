@@ -34,8 +34,13 @@ output "ecs_service_name" {
   value       = aws_ecs_service.api.name
 }
 
+output "ecs_task_definition_arn" {
+  description = "Terraform-reviewed ECS task definition ARN used to validate release configuration."
+  value       = aws_ecs_task_definition.api.arn
+}
+
 output "ecs_task_family" {
-  description = "ECS task definition family for API deployment workflows."
+  description = "ECS task definition family for staging API tasks."
   value       = aws_ecs_task_definition.api.family
 }
 

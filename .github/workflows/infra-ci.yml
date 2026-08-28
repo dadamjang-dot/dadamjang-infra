@@ -36,8 +36,6 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - name: Validate Docker Compose
         run: docker compose --env-file .env.example config --quiet
-      - name: Guard release contracts
-        run: ruby tests/release-contracts.rb
       - name: Check Terraform formatting
         run: terraform fmt -check -recursive terraform
       - name: Guard e2e isolation and scale-down contract
@@ -52,6 +50,10 @@ jobs:
         run: terraform -chdir=terraform/staging init -backend=false -input=false
       - name: Validate Terraform
         run: terraform -chdir=terraform/staging validate
+      - name: Test Terraform release contracts
+        run: terraform -chdir=terraform/staging test
+      - name: Guard release contracts
+        run: ruby tests/release-contracts.rb
       - name: Initialize e2e Terraform without a state backend
         run: terraform -chdir=terraform/e2e init -backend=false -input=false
       - name: Validate e2e Terraform

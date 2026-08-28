@@ -103,10 +103,16 @@ write_executable = lambda do |path, body|
   FileUtils.chmod(0o755, path)
 end
 
-check.call("Docker build and runtime use backend build outputs") do
-  instructions = File.readlines(File.join(root, "docker/backend.Dockerfile"), chomp: true)
+docker_instructions = lambda do
+  File.read(File.join(root, "docker/backend.Dockerfile"))
+    .gsub(/ ?\\\n\s*/, " ")
+    .lines(chomp: true)
     .map(&:strip)
     .reject { |line| line.empty? || line.start_with?("#") }
+end
+
+check.call("Docker build and runtime use backend build outputs") do
+  instructions = docker_instructions.call
   assert.call(instructions.none? { |line| line.include?("tsc scripts/migrate.ts") }, "standalone tsc remains")
   assert.call(
     instructions.include?('CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]'),
@@ -115,9 +121,7 @@ check.call("Docker build and runtime use backend build outputs") do
 end
 
 check.call("Docker runtime ships the checksum-verified AWS RDS CA bundle") do
-  instructions = File.readlines(File.join(root, "docker/backend.Dockerfile"), chomp: true)
-    .map(&:strip)
-    .reject { |line| line.empty? || line.start_with?("#") }
+  instructions = docker_instructions.call
   stages = instructions.slice_before { |line| line.match?(/\AFROM\s/i) }.to_a
   runtime_stage = stages.last.join("\n")
   bundle_url = "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
@@ -127,23 +131,31 @@ check.call("Docker runtime ships the checksum-verified AWS RDS CA bundle") do
   download_stage = stages[0...-1].find { |stage| stage.join("\n").include?(bundle_url) }
 
   assert.call(download_stage, "build stages do not fetch the official AWS RDS global bundle")
-  build_stage = download_stage.join("\n").gsub(/ ?\\\n\s*/, " ")
-  download_command = "curl --fail --silent --show-error #{bundle_url} --output #{build_bundle_path}"
-  checksum_command = %(echo "#{bundle_checksum}  #{build_bundle_path}" | sha256sum -c -)
+  build_stage = download_stage.join("\n")
+  checksum_instruction = download_stage.find { |line| line.include?("sha256sum -c -") }
   copy_command = "COPY --from=build #{build_bundle_path} #{runtime_bundle_path}"
-  assert.call(build_stage.include?(download_command), "AWS RDS bundle is not downloaded from the exact official URL to the build-stage bundle")
-  assert.call(build_stage.include?(checksum_command), "AWS RDS build-stage bundle is not verified with the pinned checksum")
+  assert.call(build_stage.include?(bundle_url), "AWS RDS bundle is not downloaded from the exact official URL")
+  assert.call(!build_stage.match?(/\b(?:curl|wget)\b|\bapk\s+add\b/), "build stage installs mutable download tooling")
+  assert.call(checksum_instruction&.start_with?("RUN echo "), "AWS RDS checksum is not an isolated executable build step")
   assert.call(runtime_stage.lines(chomp: true).include?(copy_command), "runtime image does not copy the verified build-stage AWS RDS bundle")
   assert.call(!runtime_stage.match?(/\b(?:curl|wget)\b|\bapk\s+add\b/), "runtime stage installs download tooling")
 
   Dir.mktmpdir("aws-rds-bundle-checksum") do |directory|
     rotated_bundle = File.join(directory, "aws-rds-global-bundle.pem")
-    checksum_manifest = File.join(directory, "sha256sum.txt")
     File.write(rotated_bundle, "rotated AWS RDS bundle bytes\n")
-    File.write(checksum_manifest, "#{bundle_checksum}  #{rotated_bundle}\n")
-    _, _, status = Open3.capture3("sha256sum", "-c", checksum_manifest)
-    assert.call(!status.success?, "rotated AWS RDS bundle bytes passed the pinned checksum")
+    command = checksum_instruction.delete_prefix("RUN ").gsub(build_bundle_path, rotated_bundle)
+    _, _, status = Open3.capture3("bash", "-c", command, chdir: directory)
+    assert.call(!status.success?, "checksum build step accepted rotated AWS RDS bundle bytes")
   end
+end
+
+check.call("Docker image identity pins the amd64 Node base") do
+  instructions = docker_instructions.call
+  base = "node:22-alpine@sha256:76789712cd1ae89a1225eac9077010d68987a423588042dac30446f502f1858c"
+  from_images = instructions.map { |line| line[/\AFROM\s+(\S+)/, 1] }.compact
+  assert.call(from_images == [base, base], "Node build stages do not share the verified linux/amd64 digest")
+  healthcheck = instructions.find { |line| line.start_with?("HEALTHCHECK ") }
+  assert.call(healthcheck&.include?("node") && healthcheck.include?("/health/ready"), "runtime healthcheck does not use built-in Node readiness")
 end
 
 check.call("e2e task starts the emitted backend entrypoint") do
@@ -224,6 +236,7 @@ check.call("deploy consumes only the tested release identity") do
   assert.call(!deploy_definition.include?("github.sha"), "deploy uses the infra SHA as backend identity")
   assert.call(!deploy_definition.include?("rev-parse"), "deploy re-resolves the backend commit")
   publish = step_named.call(deploy_job, "Build or reuse immutable image")
+  assert.call(publish.fetch("id") == "image", "published digest reference is not captured")
   assert.call(publish.dig("env", "IMAGE_TAG") == "${{ needs.test.outputs.image_tag }}", "publish tag is not test output")
   assert.call(
     publish.fetch("run").start_with?("bash infra/scripts/publish-backend-image.sh "),
@@ -232,7 +245,7 @@ check.call("deploy consumes only the tested release identity") do
   render_steps = deploy_job.fetch("steps").select { |step| step["uses"] == "aws-actions/amazon-ecs-render-task-definition@v1" }
   assert.call(render_steps.length == 1, "deploy must render exactly one image reference")
   render = render_steps.first
-  expected_image = "${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.test.outputs.image_tag }}"
+  expected_image = "${{ steps.image.outputs.reference }}"
   assert.call(render.dig("with", "image") == expected_image, "rendered image is not the tested image")
   release_environment = render.dig("with", "environment-variables").to_s.lines(chomp: true).to_h do |line|
     line.split("=", 2)
@@ -243,25 +256,32 @@ check.call("deploy consumes only the tested release identity") do
   )
 end
 
-check.call("image publication safely reuses immutable ECR tags") do
+check.call("image publication resolves an amd64 ECR digest after push") do
   Dir.mktmpdir("publish-image") do |directory|
     fake_bin = File.join(directory, "bin")
     FileUtils.mkdir_p(fake_bin)
     docker_log = File.join(directory, "docker.log")
     write_executable.call(File.join(fake_bin, "aws"), <<~SH)
       #!/usr/bin/env bash
-      case "$FAKE_ECR_RESULT" in
-        existing) exit 0 ;;
-        missing) printf '%s\n' 'ImageNotFoundException: missing' >&2; exit 254 ;;
-        *) printf '%s\n' 'AccessDeniedException: denied' >&2; exit 255 ;;
-      esac
+      printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
+      if [[ "$FAKE_ECR_RESULT" == "denied" ]]; then
+        printf '%s\n' 'AccessDeniedException: denied' >&2
+        exit 255
+      fi
+      if [[ "$FAKE_ECR_RESULT" == "missing" && ! -f "$FAKE_DOCKER_LOG" ]]; then
+        printf '%s\n' 'ImageNotFoundException: missing' >&2
+        exit 254
+      fi
+      printf '%s\n' 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     SH
     write_executable.call(File.join(fake_bin, "docker"), <<~SH)
       #!/usr/bin/env bash
       printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+      printf '%s\n' 'docker progress'
     SH
     base_env = {
       "PATH" => "#{fake_bin}:#{ENV.fetch("PATH")}",
+      "FAKE_AWS_LOG" => File.join(directory, "aws.log"),
       "FAKE_DOCKER_LOG" => docker_log,
     }
     command = [
@@ -269,15 +289,17 @@ check.call("image publication safely reuses immutable ECR tags") do
       "infra/docker/backend.Dockerfile", "backend",
     ]
 
-    _, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "existing"), *command, chdir: root)
+    stdout, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "existing"), *command, chdir: root)
     assert.call(status.success?, stderr)
+    assert.call(stdout.strip == "registry.example/api@sha256:#{"a" * 64}", "existing tag did not resolve to a digest reference")
     assert.call(!File.exist?(docker_log), "existing image was rebuilt")
 
-    _, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "missing"), *command, chdir: root)
+    stdout, stderr, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "missing"), *command, chdir: root)
     assert.call(status.success?, stderr)
+    assert.call(stdout.strip == "registry.example/api@sha256:#{"a" * 64}", "pushed tag did not resolve to a digest reference")
     assert.call(
       File.readlines(docker_log, chomp: true) == [
-        "build --file infra/docker/backend.Dockerfile --tag registry.example/api:release-tag backend",
+        "build --platform linux/amd64 --file infra/docker/backend.Dockerfile --tag registry.example/api:release-tag backend",
         "push registry.example/api:release-tag",
       ],
       "missing image did not build and push once",
@@ -287,6 +309,117 @@ check.call("image publication safely reuses immutable ECR tags") do
     _, _, status = Open3.capture3(base_env.merge("FAKE_ECR_RESULT" => "denied"), *command, chdir: root)
     assert.call(!status.success?, "unexpected ECR error was treated as a missing image")
     assert.call(!File.exist?(docker_log), "unexpected ECR error triggered Docker")
+  end
+end
+
+check.call("release preparation uses the deployed service and Terraform task contract") do
+  prepare = step_named.call(deploy_job, "Read deployed ECS task definition")
+  assert.call(
+    prepare.fetch("run").strip == "bash infra/scripts/prepare-ecs-task-definition.sh infra/terraform/staging task-definition.json",
+    "workflow does not prepare the deployed task definition through the contract script",
+  )
+  assert.call(!deploy_job.fetch("env").key?("AWS_ECS_TASK_FAMILY"), "deploy still selects a task definition by family")
+  output = hcl_block.call("terraform/staging/outputs.tf", /output\s+"ecs_task_definition_arn"/)
+  assert.call(hcl_arguments.call(output)["value"] == "aws_ecs_task_definition.api.arn", "Terraform state does not expose the reviewed task definition ARN")
+
+  Dir.mktmpdir("prepare-ecs") do |directory|
+    fake_bin = File.join(directory, "bin")
+    FileUtils.mkdir_p(fake_bin)
+    aws_log = File.join(directory, "aws.log")
+    output = File.join(directory, "task-definition.json")
+    canonical_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:40"
+    deployed_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/dadamjang-staging-api:41"
+    canonical = {
+      "taskDefinitionArn" => canonical_arn,
+      "containerDefinitions" => [{
+        "name" => "api",
+        "image" => "registry.example/api:bootstrap",
+        "essential" => true,
+        "environment" => [
+          { "name" => "NODE_ENV", "value" => "production" },
+          { "name" => "POSTGRES_SSL", "value" => "true" },
+          { "name" => "POSTGRES_SSL_CA_PATH", "value" => "/etc/ssl/certs/aws-rds-global-bundle.pem" },
+          { "name" => "SENTRY_RELEASE", "value" => "bootstrap" },
+        ],
+        "secrets" => [{ "name" => "POSTGRES_PASSWORD", "valueFrom" => "arn:aws:secretsmanager:database:password::" }],
+      }],
+      "family" => "dadamjang-staging-api",
+      "taskRoleArn" => "arn:aws:iam::123456789012:role/task",
+      "executionRoleArn" => "arn:aws:iam::123456789012:role/execution",
+      "networkMode" => "awsvpc",
+      "revision" => 40,
+      "volumes" => [],
+      "status" => "ACTIVE",
+      "requiresAttributes" => [],
+      "placementConstraints" => [],
+      "compatibilities" => ["EC2", "FARGATE"],
+      "requiresCompatibilities" => ["FARGATE"],
+      "cpu" => "256",
+      "memory" => "512",
+      "runtimePlatform" => { "cpuArchitecture" => "X86_64", "operatingSystemFamily" => "LINUX" },
+      "registeredAt" => "2026-08-28T00:00:00Z",
+      "registeredBy" => "terraform",
+    }
+    deployed = JSON.parse(JSON.generate(canonical))
+    deployed["taskDefinitionArn"] = deployed_arn
+    deployed["revision"] = 41
+    deployed["registeredAt"] = "2026-08-29T00:00:00Z"
+    deployed["registeredBy"] = "github"
+    deployed["containerDefinitions"][0]["image"] = "registry.example/api@sha256:#{"b" * 64}"
+    deployed["containerDefinitions"][0]["environment"].find { |item| item["name"] == "SENTRY_RELEASE" }["value"] = "release-tag"
+    canonical_path = File.join(directory, "canonical.json")
+    deployed_path = File.join(directory, "deployed.json")
+    File.write(canonical_path, JSON.generate({ "taskDefinition" => canonical }))
+    File.write(deployed_path, JSON.generate({ "taskDefinition" => deployed }))
+    write_executable.call(File.join(fake_bin, "terraform"), <<~SH)
+      #!/usr/bin/env bash
+      printf '%s\n' "$FAKE_CANONICAL_ARN"
+    SH
+    write_executable.call(File.join(fake_bin, "aws"), <<~SH)
+      #!/usr/bin/env bash
+      printf '%s\n' "$*" >> "$FAKE_AWS_LOG"
+      if [[ "$1 $2" == "ecs describe-services" ]]; then
+        printf '%s\n' "$FAKE_DEPLOYED_ARN"
+      elif [[ "$*" == *"$FAKE_CANONICAL_ARN"* ]]; then
+        cat "$FAKE_CANONICAL_TASK"
+      elif [[ "$*" == *"$FAKE_DEPLOYED_ARN"* ]]; then
+        cat "$FAKE_DEPLOYED_TASK"
+      else
+        exit 2
+      fi
+    SH
+    env = {
+      "PATH" => "#{fake_bin}:#{ENV.fetch("PATH")}",
+      "FAKE_AWS_LOG" => aws_log,
+      "FAKE_CANONICAL_ARN" => canonical_arn,
+      "FAKE_DEPLOYED_ARN" => deployed_arn,
+      "FAKE_CANONICAL_TASK" => canonical_path,
+      "FAKE_DEPLOYED_TASK" => deployed_path,
+      "AWS_ECS_CLUSTER" => "staging-cluster",
+      "AWS_ECS_SERVICE" => "staging-service",
+    }
+    command = ["bash", File.join(root, "scripts/prepare-ecs-task-definition.sh"), "terraform/staging", output]
+    _, stderr, status = Open3.capture3(env, *command, chdir: root)
+    assert.call(status.success?, stderr)
+    assert.call(JSON.parse(File.read(output)) == deployed, "prepared task definition is not the deployed service revision")
+    calls = File.readlines(aws_log, chomp: true)
+    assert.call(calls.first.include?("ecs describe-services"), "service task definition was not resolved first")
+    assert.call(calls.none? { |call| call.include?("--task-definition dadamjang-staging-api ") }, "task family latest was queried")
+
+    drifted = JSON.parse(JSON.generate(deployed))
+    drifted["containerDefinitions"][0]["secrets"] = []
+    File.write(deployed_path, JSON.generate({ "taskDefinition" => drifted }))
+    FileUtils.rm_f(output)
+    _, _, drift_status = Open3.capture3(env, *command, chdir: root)
+    assert.call(!drift_status.success?, "secret contract drift was accepted")
+    assert.call(!File.exist?(output), "invalid task definition was rendered")
+
+    invalid_tls = JSON.parse(JSON.generate(canonical))
+    invalid_tls["containerDefinitions"][0]["environment"].find { |item| item["name"] == "POSTGRES_SSL" }["value"] = "false"
+    File.write(canonical_path, JSON.generate({ "taskDefinition" => invalid_tls }))
+    File.write(deployed_path, JSON.generate({ "taskDefinition" => invalid_tls.merge("taskDefinitionArn" => deployed_arn, "revision" => 41) }))
+    _, _, tls_status = Open3.capture3(env, *command, chdir: root)
+    assert.call(!tls_status.success?, "matching task definitions with disabled PostgreSQL TLS were accepted")
   end
 end
 
@@ -440,6 +573,15 @@ check.call("staging and e2e tasks require verified PostgreSQL TLS and environmen
   end
 end
 
+check.call("staging and e2e tasks pin the published Fargate platform") do
+  %w[terraform/staging/application.tf terraform/e2e/application.tf].each do |path|
+    task = hcl_block.call(path, /resource\s+"aws_ecs_task_definition"\s+"api"/)
+    platform = hcl_arguments.call(hcl_block_from.call(task, /runtime_platform/))
+    assert.call(platform["cpu_architecture"] == '"X86_64"', "#{path} does not require amd64")
+    assert.call(platform["operating_system_family"] == '"LINUX"', "#{path} does not require Linux")
+  end
+end
+
 check.call("staging and e2e ALBs use the exact readiness contract") do
   %w[terraform/staging/application.tf terraform/e2e/application.tf].each do |path|
     target_group = hcl_block.call(path, /resource\s+"aws_lb_target_group"\s+"api"/)
@@ -448,6 +590,13 @@ check.call("staging and e2e ALBs use the exact readiness contract") do
     assert.call(arguments["path"] == '"/health/ready"', "#{path} does not use the readiness endpoint")
     assert.call(arguments["matcher"] == '"200"', "#{path} accepts non-200 health responses")
   end
+end
+
+check.call("staging ECS service waits for the HTTPS listener") do
+  graph, error, status = Open3.capture3("terraform", "-chdir=terraform/staging", "graph", "-type=plan", chdir: root)
+  assert.call(status.success?, error)
+  edge = '"[root] aws_ecs_service.api (expand)" -> "[root] aws_lb_listener.https (expand)"'
+  assert.call(graph.include?(edge), "staging ECS service does not depend on the HTTPS listener")
 end
 
 check.call("staging RDS deletion protection and final snapshot policy are independently safe") do
