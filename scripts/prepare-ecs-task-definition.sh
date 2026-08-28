@@ -15,7 +15,20 @@ if [[ ! "$SENTRY_RELEASE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
 fi
 
 release_contract=$(terraform -chdir="$terraform_root" output -json ecs_release_contract)
-if ! jq -e '
+source_files=()
+while IFS= read -r source_file; do
+  source_files+=("$source_file")
+done < <(
+  find "$terraform_root" -maxdepth 1 -type f \( -name '*.tf' -o -name '.terraform.lock.hcl' \) \
+    -exec basename {} \; | LC_ALL=C sort
+)
+if ((${#source_files[@]} == 0)); then
+  printf 'Terraform source set is empty\n' >&2
+  exit 1
+fi
+source_files_json=$(printf '%s\n' "${source_files[@]}" | jq -Rsc 'split("\n")[:-1]')
+
+if ! jq -e --argjson source_files "$source_files_json" '
   type == "object" and
   (keys | sort) == [
     "canonical_task_definition_arn",
@@ -25,7 +38,7 @@ if ! jq -e '
     "source_hashes",
     "task_family"
   ] and
-  (.source_hashes | keys | sort) == ["application.tf", "locals.tf", "outputs.tf", "variables.tf"] and
+  (.source_hashes | keys | sort) == $source_files and
   (.runtime_secret_names | type) == "array"
 ' >/dev/null <<<"$release_contract"; then
   printf 'Invalid Terraform ECS release contract\n' >&2
@@ -47,7 +60,7 @@ if [[ "${IMAGE_REFERENCE%@sha256:*}" != "$image_repository" ]]; then
   exit 1
 fi
 
-for source_file in application.tf locals.tf outputs.tf variables.tf; do
+for source_file in "${source_files[@]}"; do
   expected_hash=$(jq -er --arg source_file "$source_file" '.source_hashes[$source_file]' <<<"$release_contract")
   actual_hash=$(sha256sum "$terraform_root/$source_file" | awk '{print $1}')
   if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ || "$actual_hash" != "$expected_hash" ]]; then

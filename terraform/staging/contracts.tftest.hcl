@@ -88,12 +88,10 @@ run "release_contracts" {
         "source_hashes",
         "task_family",
       ]) &&
-      toset(keys(output.ecs_release_contract.source_hashes)) == toset([
-        "application.tf",
-        "locals.tf",
-        "outputs.tf",
-        "variables.tf",
-      ])
+      toset(keys(output.ecs_release_contract.source_hashes)) == setunion(
+        fileset(path.module, "*.tf"),
+        toset([".terraform.lock.hcl"]),
+      )
     )
     error_message = "The ECS release transition must retain its provenance fields and hashes."
   }

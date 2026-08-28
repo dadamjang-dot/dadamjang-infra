@@ -475,7 +475,11 @@ check.call("release preparation bridges only a Terraform-observed service revisi
     target_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:51"
     image_reference = "registry.example/api@sha256:#{"c" * 64}"
     secret_names = %w[JWT_ACCESS_SECRET POSTGRES_PASSWORD]
-    source_hashes = %w[application.tf locals.tf outputs.tf variables.tf].to_h do |name|
+    terraform_sources = Dir[File.join(root, "terraform/staging/*.tf")]
+      .map { |path| File.basename(path) }
+      .append(".terraform.lock.hcl")
+      .sort
+    source_hashes = terraform_sources.to_h do |name|
       [name, Digest::SHA256.file(File.join(root, "terraform/staging", name)).hexdigest]
     end
     build_task = lambda do |arn:, image:, release:, memory: "512"|
@@ -649,6 +653,16 @@ check.call("release preparation bridges only a Terraform-observed service revisi
     FileUtils.rm_f(output)
     _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
     assert.call(!status.success?, "Terraform state from different contract sources was accepted")
+
+    missing_hash = release_contract.merge("source_hashes" => source_hashes.reject { |name| name == terraform_sources.first })
+    File.write(release_contract_path, JSON.generate(missing_hash))
+    _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+    assert.call(!status.success?, "Terraform state with a missing contract source was accepted")
+
+    extra_hash = release_contract.merge("source_hashes" => source_hashes.merge("unexpected.tf" => "0" * 64))
+    File.write(release_contract_path, JSON.generate(extra_hash))
+    _, _, status = Open3.capture3(env.merge("FAKE_DEPLOYED_ARN" => canonical_arn), *command, chdir: root)
+    assert.call(!status.success?, "Terraform state with an extra contract source was accepted")
 
     File.write(release_contract_path, JSON.generate(release_contract.merge("observed_service_task_definition_arn" => canonical_arn)))
     _, _, status = Open3.capture3(

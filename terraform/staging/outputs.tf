@@ -52,10 +52,8 @@ output "ecs_release_contract" {
     observed_service_task_definition_arn = aws_ecs_service.api.task_definition
     runtime_secret_names                 = sort(concat(["POSTGRES_PASSWORD"], tolist(local.runtime_secret_keys)))
     source_hashes = {
-      "application.tf" = filesha256("${path.module}/application.tf")
-      "locals.tf"      = filesha256("${path.module}/locals.tf")
-      "outputs.tf"     = filesha256("${path.module}/outputs.tf")
-      "variables.tf"   = filesha256("${path.module}/variables.tf")
+      for source in setunion(fileset(path.module, "*.tf"), toset([".terraform.lock.hcl"])) :
+      source => filesha256("${path.module}/${source}")
     }
     task_family = aws_ecs_task_definition.api.family
   }
