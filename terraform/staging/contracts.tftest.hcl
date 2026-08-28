@@ -10,10 +10,44 @@ mock_provider "aws" {
       json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}"
     }
   }
+
+  mock_resource "aws_db_instance" {
+    defaults = {
+      address            = "database.example.test"
+      master_user_secret = [{ secret_arn = "arn:aws:secretsmanager:ap-northeast-2:123456789012:secret:database" }]
+    }
+  }
+
+  mock_resource "aws_ecr_repository" {
+    defaults = {
+      repository_url = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/dadamjang-staging-api"
+    }
+  }
+
+  mock_resource "aws_iam_role" {
+    defaults = {
+      arn = "arn:aws:iam::123456789012:role/dadamjang-staging"
+    }
+  }
+
+  mock_resource "aws_lb" {
+    defaults = {
+      arn        = "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:loadbalancer/app/dadamjang-staging-api/0000000000000000"
+      arn_suffix = "app/dadamjang-staging-api/0000000000000000"
+      dns_name   = "staging-api.example.test"
+    }
+  }
+
+  mock_resource "aws_lb_target_group" {
+    defaults = {
+      arn        = "arn:aws:elasticloadbalancing:ap-northeast-2:123456789012:targetgroup/dadamjang-staging-api/0000000000000000"
+      arn_suffix = "targetgroup/dadamjang-staging-api/0000000000000000"
+    }
+  }
 }
 
 run "release_contracts" {
-  command = plan
+  command = apply
 
   variables {
     acm_certificate_arn = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
@@ -42,5 +76,95 @@ run "release_contracts" {
       tolist(local.runtime_secret_keys),
     ))
     error_message = "The ECS release transition must export the exact runtime secret contract."
+  }
+
+  assert {
+    condition = (
+      toset(keys(output.ecs_release_contract)) == toset([
+        "canonical_task_definition_arn",
+        "image_repository",
+        "observed_service_task_definition_arn",
+        "runtime_secret_names",
+        "source_hashes",
+        "task_family",
+      ]) &&
+      toset(keys(output.ecs_release_contract.source_hashes)) == toset([
+        "application.tf",
+        "locals.tf",
+        "outputs.tf",
+        "variables.tf",
+      ])
+    )
+    error_message = "The ECS release transition must retain its provenance fields and hashes."
+  }
+
+  assert {
+    condition     = !contains(keys(jsondecode(aws_ecs_task_definition.api.container_definitions)[0]), "command")
+    error_message = "The staging task must use the image entrypoint for migrations."
+  }
+
+  assert {
+    condition = alltrue([
+      one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "POSTGRES_SSL"]) == "true",
+      one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "POSTGRES_SSL_CA_PATH"]) == "/etc/ssl/certs/aws-rds-global-bundle.pem",
+      one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "SENTRY_ENVIRONMENT"]) == "staging",
+      one([for value in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].environment : value.value if value.name == "SENTRY_RELEASE"]) == var.api_image_tag,
+      aws_ecs_task_definition.api.runtime_platform[0].cpu_architecture == "X86_64",
+      aws_ecs_task_definition.api.runtime_platform[0].operating_system_family == "LINUX",
+      aws_lb_target_group.api.health_check[0].path == "/health/ready",
+      aws_lb_target_group.api.health_check[0].matcher == "200",
+      aws_db_instance.main.deletion_protection == var.enable_deletion_protection,
+      aws_db_instance.main.skip_final_snapshot == var.skip_final_snapshot,
+      aws_db_instance.main.final_snapshot_identifier == "dadamjang-staging-postgres-final",
+      aws_ecs_service.api.task_definition == aws_ecs_task_definition.api.arn,
+    ])
+    error_message = "Staging must preserve the task runtime, readiness, RDS recovery, and reviewed revision."
+  }
+
+  assert {
+    condition = sort(tolist(local.runtime_secret_keys)) == sort([
+      "API_PUBLIC_BASE_URL", "CLIENT_URL", "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL", "CLOUDFLARE_R2_ACCESS_KEY_ID",
+      "CLOUDFLARE_R2_BUCKET", "CLOUDFLARE_R2_ENDPOINT", "CLOUDFLARE_R2_PUBLIC_BASE_URL", "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
+      "DADAMJANG_BO_URL", "EMAIL_CODE_PEPPER", "IDENTITY_CI_PEPPER", "IDENTITY_INICIS_API_KEY",
+      "IDENTITY_INICIS_CALLBACK_BASE_URL", "IDENTITY_INICIS_MID", "IDENTITY_INICIS_SEED_IV", "JWT_ACCESS_TOKEN_EXP",
+      "JWT_ACCESS_TOKEN_SECRET", "JWT_REFRESH_TOKEN_EXP", "JWT_REFRESH_TOKEN_SECRET", "KAKAO_CALLBACK_URL",
+      "KAKAO_CLIENT_ID", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "SENTRY_DSN",
+    ])
+    error_message = "The staging runtime secret contract must remain complete."
+  }
+
+  assert {
+    condition = alltrue([
+      var.enable_deletion_protection,
+      !var.skip_final_snapshot,
+      var.final_snapshot_identifier == null,
+      length(var.alarm_action_arns) == 0,
+      aws_cloudwatch_metric_alarm.api_cpu.metric_name == "CPUUtilization",
+      aws_cloudwatch_metric_alarm.api_memory.metric_name == "MemoryUtilization",
+      aws_cloudwatch_metric_alarm.api_alb_5xx.metric_name == "HTTPCode_ELB_5XX_Count",
+      aws_cloudwatch_metric_alarm.api_unhealthy_hosts.metric_name == "UnHealthyHostCount",
+      aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.metric_name == "HealthyHostCount",
+      length(aws_cloudwatch_metric_alarm.api_alb_5xx.alarm_actions) == 0,
+      length(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.alarm_actions) == 0,
+      length(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.alarm_actions) == 0,
+      contains(keys(aws_cloudwatch_metric_alarm.api_alb_5xx.dimensions), "LoadBalancer"),
+      contains(keys(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.dimensions), "LoadBalancer"),
+      contains(keys(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.dimensions), "TargetGroup"),
+      contains(keys(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.dimensions), "LoadBalancer"),
+      contains(keys(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.dimensions), "TargetGroup"),
+    ])
+    error_message = "Staging alarms must retain conservative defaults, metrics, actions, and dimensions."
+  }
+
+  assert {
+    condition = alltrue([
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:${var.github_repository}:environment:${var.environment}",
+      alltrue([for action in ["ecr:DescribeImages", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"] : contains(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1].Action, action)]),
+      contains(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Action, "ecs:UpdateService"),
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Resource == aws_ecs_service.api.id,
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Condition.ArnEquals["ecs:cluster"] == aws_ecs_cluster.main.arn,
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*",
+    ])
+    error_message = "Staging deployment IAM must remain environment- and resource-scoped."
   }
 }

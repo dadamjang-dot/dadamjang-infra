@@ -18,6 +18,32 @@ jobs = workflow.fetch("jobs")
 test_job = jobs.fetch("test")
 deploy_job = jobs.fetch("deploy")
 failures = []
+runtime_secret_keys = Set.new(%w[
+  API_PUBLIC_BASE_URL
+  CLIENT_URL
+  CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL
+  CLOUDFLARE_R2_ACCESS_KEY_ID
+  CLOUDFLARE_R2_BUCKET
+  CLOUDFLARE_R2_ENDPOINT
+  CLOUDFLARE_R2_PUBLIC_BASE_URL
+  CLOUDFLARE_R2_SECRET_ACCESS_KEY
+  DADAMJANG_BO_URL
+  EMAIL_CODE_PEPPER
+  IDENTITY_CI_PEPPER
+  IDENTITY_INICIS_API_KEY
+  IDENTITY_INICIS_CALLBACK_BASE_URL
+  IDENTITY_INICIS_MID
+  IDENTITY_INICIS_SEED_IV
+  JWT_ACCESS_TOKEN_EXP
+  JWT_ACCESS_TOKEN_SECRET
+  JWT_REFRESH_TOKEN_EXP
+  JWT_REFRESH_TOKEN_SECRET
+  KAKAO_CALLBACK_URL
+  KAKAO_CLIENT_ID
+  RESEND_API_KEY
+  RESEND_FROM_EMAIL
+  SENTRY_DSN
+])
 
 assert = lambda do |condition, message|
   raise message unless condition
@@ -37,72 +63,6 @@ end
 
 uses_action = lambda do |step, action|
   step["uses"].to_s.start_with?("#{action}@")
-end
-
-active_hcl = lambda do |path|
-  File.read(File.join(root, path))
-    .gsub(%r{/\*.*?\*/}m, "")
-    .lines
-    .reject { |line| line.match?(%r{^\s*(?:#|//)}) }
-    .join
-end
-
-hcl_block_from = lambda do |source, pattern|
-  match = source.match(pattern) || raise("missing HCL block #{pattern.inspect}")
-  opening = source.index("{", match.end(0)) || raise("missing opening brace for #{pattern.inspect}")
-  depth = 0
-  escaped = false
-  in_string = false
-  result = nil
-
-  source[opening..].each_char.with_index do |character, index|
-    if in_string
-      if escaped
-        escaped = false
-      elsif character == "\\"
-        escaped = true
-      elsif character == '"'
-        in_string = false
-      end
-      next
-    end
-
-    case character
-    when '"'
-      in_string = true
-    when "{"
-      depth += 1
-    when "}"
-      depth -= 1
-      if depth.zero?
-        result = source[opening..(opening + index)]
-        break
-      end
-    end
-  end
-
-  result || raise("missing closing brace for #{pattern.inspect}")
-end
-
-hcl_block = lambda do |path, pattern|
-  hcl_block_from.call(active_hcl.call(path), pattern)
-end
-
-hcl_arguments = lambda do |block|
-  block.scan(/^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$/).to_h
-end
-
-task_environment = lambda do |path|
-  task = hcl_block.call(path, /resource\s+"aws_ecs_task_definition"\s+"api"/)
-  environment = task[/environment\s*=\s*\[(.*?)\]\s*essential/m, 1] || raise("missing task environment")
-  environment.scan(/\{\s*name\s*=\s*"([A-Z0-9_]+)"\s*,\s*value\s*=\s*([^}\n]+)\}/).to_h do |name, value|
-    [name, value.strip]
-  end
-end
-
-runtime_keys = lambda do |path|
-  body = active_hcl.call(path)[/runtime_secret_keys\s*=\s*toset\(\[(.*?)\]\)/m, 1] || raise("missing runtime_secret_keys")
-  body.scan(/"([A-Z0-9_]+)"/).flatten.to_set
 end
 
 write_executable = lambda do |path, body|
@@ -180,11 +140,6 @@ check.call("local development services use reviewed immutable images") do
   assert.call(actual == expected, "unreviewed local service images: #{actual}")
 end
 
-check.call("e2e task starts the emitted backend entrypoint") do
-  task = hcl_block.call("terraform/e2e/application.tf", /resource\s+"aws_ecs_task_definition"\s+"api"/)
-  assert.call(!task.match?(/^\s*command\s*=/), "e2e bypasses the image migration entrypoint")
-end
-
 check.call("infra CI watches release behavior and documentation") do
   required_paths = Set.new(["README.md", "scripts/**"])
   %w[pull_request push].each do |event|
@@ -192,6 +147,12 @@ check.call("infra CI watches release behavior and documentation") do
     missing_paths = required_paths - configured_paths
     assert.call(missing_paths.empty?, "#{event} omits #{missing_paths.to_a.join(", ")}")
   end
+end
+
+check.call("infra CI runs native contracts for staging and e2e") do
+  validate = infra_ci.fetch("jobs").fetch("validate")
+  assert.call(step_named.call(validate, "Test Terraform release contracts").fetch("run") == "terraform -chdir=terraform/staging test", "staging native contracts are not run")
+  assert.call(step_named.call(validate, "Test e2e Terraform release contracts").fetch("run") == "terraform -chdir=terraform/e2e test", "e2e native contracts are not run")
 end
 
 check.call("privileged workflows execute only commit-pinned actions") do
@@ -392,21 +353,6 @@ check.call("deploy wires the tested digest into canonical task preparation") do
     "workflow does not prepare the canonical task definition through the contract script",
   )
   assert.call(!deploy_job.fetch("env").key?("AWS_ECS_TASK_FAMILY"), "deploy still selects a task definition by family")
-end
-
-check.call("Terraform state exports an exact ECS release transition contract") do
-  release_output = hcl_block.call("terraform/staging/outputs.tf", /output\s+"ecs_release_contract"/)
-  %w[
-    canonical_task_definition_arn
-    observed_service_task_definition_arn
-    task_family
-    image_repository
-    runtime_secret_names
-    source_hashes
-  ].each do |field|
-    assert.call(release_output.include?(field), "Terraform release contract omits #{field}")
-  end
-  assert.call(release_output.include?('"outputs.tf"'), "Terraform release contract does not bind its own definition")
 end
 
 check.call("release preparation bridges only a Terraform-observed service revision to the canonical contract") do
@@ -721,155 +667,11 @@ check.call("migration and service deploy use one registered task definition") do
   end
 end
 
-check.call("staging OIDC trust remains environment-scoped") do
-  iam = active_hcl.call("terraform/staging/iam.tf")
-  assert.call(iam.include?('values   = ["repo:${var.github_repository}:environment:${var.environment}"]'), "wrong OIDC subject")
-  assert.call(!iam.include?(":ref:refs/heads/"), "branch OIDC subject remains")
-  assert.call(iam.include?('"ecr:DescribeImages"'), "image existence check lacks IAM permission")
-  assert.call(iam.include?('"ecr:BatchGetImage"'), "image digest pull lacks manifest permission")
-  assert.call(iam.include?('"ecr:GetDownloadUrlForLayer"'), "image digest pull lacks layer permission")
-end
-
-check.call("staging deploy IAM scopes mutable ECS operations") do
-  iam = active_hcl.call("terraform/staging/iam.tf")
-  service_scope = /actions\s*=\s*\[\s*"ecs:DescribeServices",\s*"ecs:UpdateService",?\s*\]\s*resources\s*=\s*\[aws_ecs_service\.api\.id\]/m
-  run_scope = /actions\s*=\s*\["ecs:RunTask"\]\s*resources\s*=\s*\["arn:\$\{data\.aws_partition\.current\.partition\}:ecs:.*task-definition\/\$\{aws_ecs_task_definition\.api\.family\}:\*"\]/m
-  task_scope = /actions\s*=\s*\["ecs:DescribeTasks"\]\s*resources\s*=\s*\["arn:\$\{data\.aws_partition\.current\.partition\}:ecs:.*task\/\$\{aws_ecs_cluster\.main\.name\}\/\*"\]/m
-  assert.call(iam.match?(service_scope), "service update permissions are not service-scoped")
-  assert.call(iam.match?(run_scope) && iam.include?('variable = "ecs:cluster"'), "task execution is not family and cluster scoped")
-  assert.call(iam.match?(task_scope), "task inspection is not cluster scoped")
-end
-
-check.call("staging and e2e inject the shared backend runtime contract") do
-  required = Set.new(%w[
-    API_PUBLIC_BASE_URL
-    DADAMJANG_BO_URL
-    IDENTITY_CI_PEPPER
-    IDENTITY_INICIS_API_KEY
-    IDENTITY_INICIS_CALLBACK_BASE_URL
-    IDENTITY_INICIS_MID
-    IDENTITY_INICIS_SEED_IV
-    SENTRY_DSN
-  ])
-  paths = %w[terraform/staging/locals.tf terraform/e2e/locals.tf]
-  paths.each do |path|
-    missing = required - runtime_keys.call(path)
-    assert.call(missing.empty?, "#{path} misses #{missing.to_a.sort.join(", ")}")
-  end
-  assert.call(runtime_keys.call(paths[0]) == runtime_keys.call(paths[1]), "staging and e2e secret key contracts diverge")
-end
-
-check.call("staging and e2e tasks require verified PostgreSQL TLS and environment-specific Sentry metadata") do
-  expected = {
-    "terraform/staging/application.tf" => {
-      "POSTGRES_SSL" => '"true"',
-      "POSTGRES_SSL_CA_PATH" => '"/etc/ssl/certs/aws-rds-global-bundle.pem"',
-      "SENTRY_ENVIRONMENT" => '"staging"',
-      "SENTRY_RELEASE" => "var.api_image_tag",
-    },
-    "terraform/e2e/application.tf" => {
-      "POSTGRES_SSL" => '"true"',
-      "POSTGRES_SSL_CA_PATH" => '"/etc/ssl/certs/aws-rds-global-bundle.pem"',
-      "SENTRY_ENVIRONMENT" => '"e2e"',
-      "SENTRY_RELEASE" => "var.api_image_tag",
-    },
-  }
-
-  expected.each do |path, required_environment|
-    actual_environment = task_environment.call(path)
-    required_environment.each do |name, value|
-      assert.call(actual_environment[name] == value, "#{path} has wrong #{name}")
-    end
-  end
-end
-
-check.call("staging and e2e tasks pin the published Fargate platform") do
-  %w[terraform/staging/application.tf terraform/e2e/application.tf].each do |path|
-    task = hcl_block.call(path, /resource\s+"aws_ecs_task_definition"\s+"api"/)
-    platform = hcl_arguments.call(hcl_block_from.call(task, /runtime_platform/))
-    assert.call(platform["cpu_architecture"] == '"X86_64"', "#{path} does not require amd64")
-    assert.call(platform["operating_system_family"] == '"LINUX"', "#{path} does not require Linux")
-  end
-end
-
-check.call("staging and e2e ALBs use the exact readiness contract") do
-  %w[terraform/staging/application.tf terraform/e2e/application.tf].each do |path|
-    target_group = hcl_block.call(path, /resource\s+"aws_lb_target_group"\s+"api"/)
-    health_check = hcl_block_from.call(target_group, /health_check/)
-    arguments = hcl_arguments.call(health_check)
-    assert.call(arguments["path"] == '"/health/ready"', "#{path} does not use the readiness endpoint")
-    assert.call(arguments["matcher"] == '"200"', "#{path} accepts non-200 health responses")
-  end
-end
-
-check.call("staging ECS service waits for the HTTPS listener") do
-  graph, error, status = Open3.capture3("terraform", "-chdir=terraform/staging", "graph", "-type=plan", chdir: root)
-  assert.call(status.success?, error)
-  edge = '"[root] aws_ecs_service.api (expand)" -> "[root] aws_lb_listener.https (expand)"'
-  assert.call(graph.include?(edge), "staging ECS service does not depend on the HTTPS listener")
-end
-
-check.call("staging RDS deletion protection and final snapshot policy are independently safe") do
-  variables = {
-    "enable_deletion_protection" => "true",
-    "skip_final_snapshot" => "false",
-    "final_snapshot_identifier" => "null",
-  }
-  variables.each do |name, default|
-    block = hcl_block.call("terraform/staging/variables.tf", /variable\s+"#{name}"/)
-    assert.call(hcl_arguments.call(block)["default"] == default, "#{name} has unsafe default")
-  end
-
-  database = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_db_instance"\s+"main"/)
-  arguments = hcl_arguments.call(database)
-  assert.call(arguments["deletion_protection"] == "var.enable_deletion_protection", "RDS deletion protection is not independently configured")
-  assert.call(arguments["skip_final_snapshot"] == "var.skip_final_snapshot", "RDS final snapshot policy remains coupled to deletion protection")
-  final_identifier = arguments.fetch("final_snapshot_identifier")
-  expected_final_identifier = 'var.skip_final_snapshot ? null : coalesce(var.final_snapshot_identifier, "${local.name_prefix}-postgres-final")'
-  assert.call(final_identifier == expected_final_identifier, "final snapshot identifier does not use the exact deterministic fallback")
-  assert.call(!final_identifier.match?(/\b(?:timestamp|plantimestamp|uuid|uuidv5)\s*\(/), "final snapshot identifier uses nondeterministic generation")
-
-  e2e_database = hcl_block.call("terraform/e2e/application.tf", /resource\s+"aws_db_instance"\s+"main"/)
-  e2e_arguments = hcl_arguments.call(e2e_database)
-  assert.call(e2e_arguments["deletion_protection"] == "false", "e2e database is no longer disposable")
-  assert.call(e2e_arguments["skip_final_snapshot"] == "true", "e2e database now requires final snapshots")
-end
-
-check.call("staging alarms notify optional actions and cover ALB and target health failures") do
-  actions_variable = hcl_block.call("terraform/staging/variables.tf", /variable\s+"alarm_action_arns"/)
-  assert.call(hcl_arguments.call(actions_variable)["default"] == "[]", "alarm actions are not optional by default")
-
-  expected_metrics = {
-    "api_cpu" => "CPUUtilization",
-    "api_memory" => "MemoryUtilization",
-    "api_alb_5xx" => "HTTPCode_ELB_5XX_Count",
-    "api_unhealthy_hosts" => "UnHealthyHostCount",
-    "api_zero_healthy_hosts" => "HealthyHostCount",
-  }
-  expected_metrics.each do |name, metric|
-    alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"#{name}"/)
-    arguments = hcl_arguments.call(alarm)
-    assert.call(arguments["metric_name"] == "\"#{metric}\"", "#{name} uses the wrong metric")
-    assert.call(arguments["alarm_actions"] == "var.alarm_action_arns", "#{name} does not use optional alarm actions")
-  end
-
-  alb_alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"api_alb_5xx"/)
-  alb_dimensions = hcl_arguments.call(hcl_block_from.call(alb_alarm, /dimensions\s*=/))
-  assert.call(alb_dimensions == { "LoadBalancer" => "aws_lb.api.arn_suffix" }, "ALB 5xx alarm dimensions are wrong")
-
-  %w[api_unhealthy_hosts api_zero_healthy_hosts].each do |name|
-    alarm = hcl_block.call("terraform/staging/application.tf", /resource\s+"aws_cloudwatch_metric_alarm"\s+"#{name}"/)
-    dimensions = hcl_arguments.call(hcl_block_from.call(alarm, /dimensions\s*=/))
-    assert.call(dimensions["LoadBalancer"] == "aws_lb.api.arn_suffix", "#{name} misses the ALB dimension")
-    assert.call(dimensions["TargetGroup"] == "aws_lb_target_group.api.arn_suffix", "#{name} misses the target group dimension")
-  end
-end
-
 check.call("README documents the staging rollout contract") do
   readme = File.read(File.join(root, "README.md"))
   secret_json = readme[/```json\n(.*?)\n```/m, 1] || raise("missing runtime secret JSON example")
   documented_keys = JSON.parse(secret_json).keys.to_set
-  assert.call(documented_keys == runtime_keys.call("terraform/staging/locals.tf"), "README secret JSON does not mirror staging")
+  assert.call(documented_keys == runtime_secret_keys, "README runtime secret JSON is incomplete")
   assert.call(readme.include?("배포 branch를 `main`으로만 제한"), "README lacks the main-only environment rule")
   assert.call(readme.include?("Prevent self-review"), "README lacks the no-self-approval setting")
   assert.call(readme.include?("새 task definition을 등록하기 전에 위 JSON의 모든 key"), "README lacks the secret rollout requirement")

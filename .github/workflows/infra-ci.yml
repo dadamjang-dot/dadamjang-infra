@@ -61,3 +61,5 @@ jobs:
         run: terraform -chdir=terraform/e2e init -backend=false -input=false
       - name: Validate e2e Terraform
         run: terraform -chdir=terraform/e2e validate
+      - name: Test e2e Terraform release contracts
+        run: terraform -chdir=terraform/e2e test
