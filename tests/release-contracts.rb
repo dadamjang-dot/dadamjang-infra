@@ -11,6 +11,7 @@ require "yaml"
 root = File.expand_path("..", __dir__)
 workflow = YAML.load_file(File.join(root, ".github/workflows/api-deploy.yml"))
 infra_ci = YAML.load_file(File.join(root, ".github/workflows/infra-ci.yml"))
+terraform_apply = YAML.load_file(File.join(root, ".github/workflows/terraform-apply.yml"))
 compose = YAML.load_file(File.join(root, "docker-compose.yml"))
 infra_ci_triggers = infra_ci["on"] || infra_ci.fetch(true)
 jobs = workflow.fetch("jobs")
@@ -121,8 +122,8 @@ check.call("Docker build and runtime use backend build outputs") do
   instructions = docker_instructions.call
   assert.call(instructions.none? { |line| line.include?("tsc scripts/migrate.ts") }, "standalone tsc remains")
   assert.call(
-    instructions.include?('CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]'),
-    "runtime command does not use emitted paths",
+    instructions.include?('CMD ["sh", "-c", "node dist/scripts/migrate.js && exec node dist/src/main.js"]'),
+    "runtime command does not migrate before handing PID 1 to Node",
   )
   assert.call(
     instructions.include?("COPY --from=build --chown=node:node /app/retired-migrations ./retired-migrations"),
@@ -180,8 +181,8 @@ check.call("local development services use reviewed immutable images") do
 end
 
 check.call("e2e task starts the emitted backend entrypoint") do
-  application = active_hcl.call("terraform/e2e/application.tf")
-  assert.call(application.include?('command = ["node", "dist/src/main.js"]'), "wrong e2e entrypoint")
+  task = hcl_block.call("terraform/e2e/application.tf", /resource\s+"aws_ecs_task_definition"\s+"api"/)
+  assert.call(!task.match?(/^\s*command\s*=/), "e2e bypasses the image migration entrypoint")
 end
 
 check.call("infra CI watches release behavior and documentation") do
@@ -197,12 +198,24 @@ check.call("privileged workflows execute only commit-pinned actions") do
   {
     ".github/workflows/api-deploy.yml" => workflow,
     ".github/workflows/infra-ci.yml" => infra_ci,
+    ".github/workflows/terraform-apply.yml" => terraform_apply,
   }.each do |path, definition|
     mutable = definition.fetch("jobs").values.flat_map { |job| job.fetch("steps") }
       .map { |step| step["uses"] }
       .compact
       .reject { |uses| uses.match?(%r{\A[^@\s]+@[0-9a-f]{40}\z}) }
     assert.call(mutable.empty?, "#{path} has mutable action refs: #{mutable.join(", ")}")
+  end
+end
+
+check.call("workflows use the reviewed Terraform CLI") do
+  [workflow, infra_ci, terraform_apply].each do |definition|
+    setup_steps = definition.fetch("jobs").values.flat_map { |job| job.fetch("steps") }
+      .select { |step| uses_action.call(step, "hashicorp/setup-terraform") }
+    assert.call(!setup_steps.empty?, "workflow does not install Terraform")
+    setup_steps.each do |step|
+      assert.call(step.dig("with", "terraform_version").to_s == "1.15.7", "workflow does not pin Terraform 1.15.7")
+    end
   end
 end
 
@@ -393,6 +406,7 @@ check.call("Terraform state exports an exact ECS release transition contract") d
   ].each do |field|
     assert.call(release_output.include?(field), "Terraform release contract omits #{field}")
   end
+  assert.call(release_output.include?('"outputs.tf"'), "Terraform release contract does not bind its own definition")
 end
 
 check.call("release preparation bridges only a Terraform-observed service revision to the canonical contract") do
@@ -411,7 +425,7 @@ check.call("release preparation bridges only a Terraform-observed service revisi
     target_arn = "arn:aws:ecs:ap-northeast-2:123456789012:task-definition/#{family}:51"
     image_reference = "registry.example/api@sha256:#{"c" * 64}"
     secret_names = %w[JWT_ACCESS_SECRET POSTGRES_PASSWORD]
-    source_hashes = %w[application.tf locals.tf variables.tf].to_h do |name|
+    source_hashes = %w[application.tf locals.tf outputs.tf variables.tf].to_h do |name|
       [name, Digest::SHA256.file(File.join(root, "terraform/staging", name)).hexdigest]
     end
     build_task = lambda do |arn:, image:, release:, memory: "512"|
@@ -712,6 +726,18 @@ check.call("staging OIDC trust remains environment-scoped") do
   assert.call(iam.include?('values   = ["repo:${var.github_repository}:environment:${var.environment}"]'), "wrong OIDC subject")
   assert.call(!iam.include?(":ref:refs/heads/"), "branch OIDC subject remains")
   assert.call(iam.include?('"ecr:DescribeImages"'), "image existence check lacks IAM permission")
+  assert.call(iam.include?('"ecr:BatchGetImage"'), "image digest pull lacks manifest permission")
+  assert.call(iam.include?('"ecr:GetDownloadUrlForLayer"'), "image digest pull lacks layer permission")
+end
+
+check.call("staging deploy IAM scopes mutable ECS operations") do
+  iam = active_hcl.call("terraform/staging/iam.tf")
+  service_scope = /actions\s*=\s*\[\s*"ecs:DescribeServices",\s*"ecs:UpdateService",?\s*\]\s*resources\s*=\s*\[aws_ecs_service\.api\.id\]/m
+  run_scope = /actions\s*=\s*\["ecs:RunTask"\]\s*resources\s*=\s*\["arn:\$\{data\.aws_partition\.current\.partition\}:ecs:.*task-definition\/\$\{aws_ecs_task_definition\.api\.family\}:\*"\]/m
+  task_scope = /actions\s*=\s*\["ecs:DescribeTasks"\]\s*resources\s*=\s*\["arn:\$\{data\.aws_partition\.current\.partition\}:ecs:.*task\/\$\{aws_ecs_cluster\.main\.name\}\/\*"\]/m
+  assert.call(iam.match?(service_scope), "service update permissions are not service-scoped")
+  assert.call(iam.match?(run_scope) && iam.include?('variable = "ecs:cluster"'), "task execution is not family and cluster scoped")
+  assert.call(iam.match?(task_scope), "task inspection is not cluster scoped")
 end
 
 check.call("staging and e2e inject the shared backend runtime contract") do

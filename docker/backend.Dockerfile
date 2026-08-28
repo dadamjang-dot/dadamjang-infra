@@ -31,4 +31,4 @@ EXPOSE 5500
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "--input-type=module", "-e", "const response = await fetch('http://127.0.0.1:5500/health/ready'); if (!response.ok) process.exit(1)"]
 
-CMD ["sh", "-c", "node dist/scripts/migrate.js && node dist/src/main.js"]
+CMD ["sh", "-c", "node dist/scripts/migrate.js && exec node dist/src/main.js"]

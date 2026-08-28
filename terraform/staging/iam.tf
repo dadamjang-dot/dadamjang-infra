@@ -1,5 +1,7 @@
 data "aws_caller_identity" "current" {}
 
+data "aws_partition" "current" {}
+
 data "aws_iam_policy_document" "ecs_task_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -85,8 +87,10 @@ data "aws_iam_policy_document" "github_api_deploy" {
   statement {
     actions = [
       "ecr:BatchCheckLayerAvailability",
+      "ecr:BatchGetImage",
       "ecr:CompleteLayerUpload",
       "ecr:DescribeImages",
+      "ecr:GetDownloadUrlForLayer",
       "ecr:InitiateLayerUpload",
       "ecr:PutImage",
       "ecr:UploadLayerPart",
@@ -96,14 +100,34 @@ data "aws_iam_policy_document" "github_api_deploy" {
 
   statement {
     actions = [
-      "ecs:DescribeServices",
       "ecs:DescribeTaskDefinition",
-      "ecs:DescribeTasks",
       "ecs:RegisterTaskDefinition",
-      "ecs:RunTask",
-      "ecs:UpdateService",
     ]
     resources = ["*"]
+  }
+
+  statement {
+    actions = [
+      "ecs:DescribeServices",
+      "ecs:UpdateService",
+    ]
+    resources = [aws_ecs_service.api.id]
+  }
+
+  statement {
+    actions   = ["ecs:RunTask"]
+    resources = ["arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.api.family}:*"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = [aws_ecs_cluster.main.arn]
+    }
+  }
+
+  statement {
+    actions   = ["ecs:DescribeTasks"]
+    resources = ["arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*"]
   }
 
   statement {

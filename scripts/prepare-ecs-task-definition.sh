@@ -25,7 +25,7 @@ if ! jq -e '
     "source_hashes",
     "task_family"
   ] and
-  (.source_hashes | keys | sort) == ["application.tf", "locals.tf", "variables.tf"] and
+  (.source_hashes | keys | sort) == ["application.tf", "locals.tf", "outputs.tf", "variables.tf"] and
   (.runtime_secret_names | type) == "array"
 ' >/dev/null <<<"$release_contract"; then
   printf 'Invalid Terraform ECS release contract\n' >&2
@@ -47,7 +47,7 @@ if [[ "${IMAGE_REFERENCE%@sha256:*}" != "$image_repository" ]]; then
   exit 1
 fi
 
-for source_file in application.tf locals.tf variables.tf; do
+for source_file in application.tf locals.tf outputs.tf variables.tf; do
   expected_hash=$(jq -er --arg source_file "$source_file" '.source_hashes[$source_file]' <<<"$release_contract")
   actual_hash=$(sha256sum "$terraform_root/$source_file" | awk '{print $1}')
   if [[ ! "$expected_hash" =~ ^[0-9a-f]{64}$ || "$actual_hash" != "$expected_hash" ]]; then
