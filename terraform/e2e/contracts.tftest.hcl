@@ -66,6 +66,16 @@ run "release_contracts" {
   }
 
   assert {
+    condition     = output.e2e_api_url == "https://api.e2e.example.test/graphql"
+    error_message = "The mobile API URL must target the backend GraphQL route."
+  }
+
+  assert {
+    condition     = output.e2e_aws_region == var.aws_region
+    error_message = "The mobile workflow region must match the Terraform provider region."
+  }
+
+  assert {
     condition = (
       length(jsondecode(aws_ecr_lifecycle_policy.api.policy).rules) > 0 &&
       alltrue([

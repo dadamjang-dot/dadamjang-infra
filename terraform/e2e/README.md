@@ -28,6 +28,7 @@ The AWS job must use `environment: mobile-e2e`, `permissions: { contents: read, 
 | --- | --- | --- |
 | `E2E_AWS_ROLE_ARN` | `e2e_aws_role_arn` | No |
 | `E2E_API_URL` | `e2e_api_url` | No |
+| `E2E_AWS_REGION` | `e2e_aws_region` | No |
 | `AWS_ECS_CLUSTER` | `ecs_cluster_name` | No |
 | `AWS_ECS_SERVICE` | `ecs_service_name` | No |
 | `AWS_ECS_TASK_DEFINITION` | `ecs_task_definition_arn` | No |

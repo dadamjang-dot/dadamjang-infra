@@ -10,7 +10,12 @@ output "api_ecr_repository_url" {
 
 output "e2e_api_url" {
   description = "E2E_API_URL for the mobile workflow."
-  value       = "https://${var.api_hostname}"
+  value       = "https://${var.api_hostname}/graphql"
+}
+
+output "e2e_aws_region" {
+  description = "E2E_AWS_REGION for the protected mobile e2e workflow."
+  value       = var.aws_region
 }
 
 output "e2e_aws_role_arn" {
