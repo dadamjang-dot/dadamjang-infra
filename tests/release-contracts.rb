@@ -4,6 +4,7 @@ require "fileutils"
 require "digest"
 require "json"
 require "open3"
+require "shellwords"
 require "set"
 require "tmpdir"
 require "yaml"
@@ -68,6 +69,24 @@ end
 write_executable = lambda do |path, body|
   File.write(path, body)
   FileUtils.chmod(0o755, path)
+end
+
+terraform_apply_command = lambda do |command|
+  command.gsub(/\\\r?\n/, " ").lines.any? do |line|
+    tokens = Shellwords.shellsplit(line)
+    tokens.each_index.any? do |index|
+      next false unless tokens[index] == "terraform"
+
+      arguments = tokens[(index + 1)..-1] || []
+      while arguments.first&.start_with?("-")
+        option = arguments.shift
+        arguments.shift if option == "-chdir"
+      end
+      arguments.first == "apply"
+    end
+  rescue ArgumentError
+    false
+  end
 end
 
 docker_instructions = lambda do
@@ -214,35 +233,91 @@ check.call("infra CI runs native contracts for staging and e2e") do
 end
 
 check.call("Terraform roots select remote state for partial backend configuration") do
+  version_output, version_error, version_status = Open3.capture3("terraform", "version", "-json", chdir: root)
+  assert.call(version_status.success?, version_error)
+  terraform_platform = JSON.parse(version_output).fetch("platform")
+
   %w[staging e2e].each do |environment|
     Dir.mktmpdir("#{environment}-backend") do |directory|
+      Dir.glob(File.join(root, "terraform/#{environment}/*.tf")).each do |path|
+        FileUtils.cp(path, directory)
+      end
       backend_config = File.join(directory, "backend.hcl")
       plugin_directory = File.join(directory, "plugins")
-      FileUtils.mkdir_p(plugin_directory)
+      provider_directory = File.join(
+        plugin_directory,
+        "registry.terraform.io/hashicorp/aws/6.0.0/#{terraform_platform}",
+      )
+      FileUtils.mkdir_p(provider_directory)
+      write_executable.call(
+        File.join(provider_directory, "terraform-provider-aws_v6.0.0_x5"),
+        "#!/bin/sh\nexit 1\n",
+      )
       File.write(backend_config, <<~HCL)
-        hostname     = "127.0.0.1"
+        hostname     = "terraform.invalid"
         organization = "example"
 
         workspaces {
           name = "dadamjang-#{environment}"
         }
       HCL
-      stdout, stderr, = Open3.capture3(
-        { "TF_DATA_DIR" => File.join(directory, "data") },
+      stdout, stderr, status = Open3.capture3(
+        {
+          "ALL_PROXY" => "http://127.0.0.1:1",
+          "HTTP_PROXY" => "http://127.0.0.1:1",
+          "HTTPS_PROXY" => "http://127.0.0.1:1",
+          "NO_PROXY" => "",
+          "TF_DATA_DIR" => File.join(directory, "data"),
+          "all_proxy" => "http://127.0.0.1:1",
+          "http_proxy" => "http://127.0.0.1:1",
+          "https_proxy" => "http://127.0.0.1:1",
+          "no_proxy" => "",
+        },
         "terraform",
-        "-chdir=terraform/#{environment}",
         "init",
         "-input=false",
         "-get=false",
-        "-backend-config=#{backend_config}",
+        "-backend-config=backend.hcl",
         "-plugin-dir=#{plugin_directory}",
         "-no-color",
-        chdir: root,
+        chdir: directory,
       )
       output = stdout + stderr
+      assert.call(!status.success?, "#{environment} unexpectedly initialized against the controlled endpoint")
+      assert.call(
+        output.include?("Failed to request discovery document"),
+        "#{environment} did not reach the expected backend discovery failure:\n#{output}",
+      )
+      assert.call(output.include?("https://terraform.invalid/.well-known/terraform.json"), "#{environment} contacted an unexpected backend endpoint")
+      assert.call(output.include?("127.0.0.1:1"), "#{environment} backend discovery escaped the loopback proxy")
+      assert.call(!output.include?("Invalid backend configuration argument"), "#{environment} rejected a supported backend argument")
+      assert.call(!output.include?("Unsupported argument"), "#{environment} rejected the supported backend configuration")
       assert.call(!output.include?("Missing backend configuration"), "#{environment} ignores its remote backend configuration")
     end
   end
+end
+
+check.call("Terraform backend contracts exclude unsupported execution settings") do
+  [
+    ".github/workflows/api-deploy.yml",
+    ".github/workflows/terraform-apply.yml",
+    "README.md",
+    "terraform/e2e/README.md",
+  ].each do |path|
+    contents = File.read(File.join(root, path))
+    assert.call(!contents.match?(/\boperations\b/i), "#{path} includes the unsupported remote backend operations key")
+  end
+end
+
+check.call("Terraform apply detection handles CLI global options") do
+  assert.call(
+    terraform_apply_command.call("terraform -chdir=terraform/staging apply -input=false staging.tfplan"),
+    "Terraform apply detection misses -chdir before the subcommand",
+  )
+  assert.call(
+    !terraform_apply_command.call("terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan"),
+    "Terraform apply detection rejects a plan command",
+  )
 end
 
 check.call("Terraform workflow is plan-only with complete protected inputs") do
@@ -257,9 +332,15 @@ check.call("Terraform workflow is plan-only with complete protected inputs") do
   validation = step_named.call(terraform_job, "Validate Terraform inputs")
   initialization = step_named.call(terraform_job, "Initialize Terraform state backend")
   assert.call(terraform_job.fetch("steps").index(validation) < terraform_job.fetch("steps").index(initialization), "Terraform inputs are not validated before initialization")
-  assert.call(initialization.fetch("run").include?("-backend-config=operations=false"), "Terraform plan can execute outside the GitHub runner")
+  assert.call(
+    initialization.fetch("run").split.grep(/\A-backend-config=/) == ["-backend-config=backend.hcl"],
+    "Terraform plan passes unsupported inline backend configuration",
+  )
   deploy_initialization = step_named.call(deploy_job, "Initialize Terraform state backend")
-  assert.call(deploy_initialization.fetch("run").include?("-backend-config=operations=false"), "release state reads can execute outside the GitHub runner")
+  assert.call(
+    deploy_initialization.fetch("run").split.grep(/\A-backend-config=/) == ["-backend-config=backend.hcl"],
+    "release state reads pass unsupported inline backend configuration",
+  )
   _, _, empty_status = Open3.capture3(
     { "TF_VAR_acm_certificate_arn" => nil, "TF_VAR_api_hostname" => nil },
     "bash", "-eu", "-c", validation.fetch("run"),
@@ -276,8 +357,9 @@ check.call("Terraform workflow is plan-only with complete protected inputs") do
   assert.call(!empty_status.success?, "Terraform input validation accepts blank protected variables")
   assert.call(valid_status.success?, valid_error)
 
+  workflow_commands = terraform_job.fetch("steps").map { |step| step["run"] }.compact
+  assert.call(!workflow_commands.any? { |command| terraform_apply_command.call(command) }, "Terraform workflow can still apply an unreviewed plan")
   workflow_definition = JSON.generate(terraform_apply)
-  assert.call(!workflow_definition.match?(/terraform\s+apply/), "Terraform workflow can still apply an unreviewed plan")
   assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
 end
 

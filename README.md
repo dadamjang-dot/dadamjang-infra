@@ -47,7 +47,7 @@ terraform validate
 ```bash
 export TF_VAR_acm_certificate_arn="arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
 export TF_VAR_api_hostname="api.staging.example.com"
-terraform init -reconfigure -backend-config=backend.hcl -backend-config=operations=false
+terraform init -reconfigure -backend-config=backend.hcl
 terraform plan -input=false
 ```
 
@@ -57,15 +57,15 @@ CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `t
 
 ```hcl
 # 예: HCP Terraform remote backend 설정
+hostname     = "app.terraform.io"
 organization = "your-terraform-cloud-organization"
-operations   = false
 
 workspaces {
   name = "dadamjang-staging"
 }
 ```
 
-staging과 e2e root module은 빈 `remote` backend block을 선언한다. CI가 위 partial 설정을 `backend.hcl`로 전달하고 `operations=false`를 강제하므로 plan은 GitHub runner에서 실행되며 HCP는 state만 저장한다. 로컬 plan도 Git에 포함되지 않는 같은 형식의 파일과 `operations=false`로 원격 state를 사용한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
 첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 

@@ -35,6 +35,6 @@ jobs:
       - name: Write Terraform backend configuration
         run: printf '%s' "$TF_BACKEND_CONFIG" > terraform/staging/backend.hcl
       - name: Initialize Terraform state backend
-        run: terraform -chdir=terraform/staging init -input=false -backend-config=backend.hcl -backend-config=operations=false
+        run: terraform -chdir=terraform/staging init -input=false -backend-config=backend.hcl
       - name: Terraform plan
         run: terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan

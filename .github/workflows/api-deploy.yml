@@ -146,7 +146,7 @@ jobs:
           TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
         run: printf '%s' "$TF_BACKEND_CONFIG" > infra/terraform/staging/backend.hcl
       - name: Initialize Terraform state backend
-        run: terraform -chdir=infra/terraform/staging init -input=false -backend-config=backend.hcl -backend-config=operations=false
+        run: terraform -chdir=infra/terraform/staging init -input=false -backend-config=backend.hcl
       - name: Prepare reviewed ECS task definition
         env:
           IMAGE_REFERENCE: ${{ steps.image.outputs.reference }}
