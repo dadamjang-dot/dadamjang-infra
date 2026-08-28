@@ -144,6 +144,8 @@ run "release_contracts" {
       aws_cloudwatch_metric_alarm.api_alb_5xx.metric_name == "HTTPCode_ELB_5XX_Count",
       aws_cloudwatch_metric_alarm.api_unhealthy_hosts.metric_name == "UnHealthyHostCount",
       aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.metric_name == "HealthyHostCount",
+      length(aws_cloudwatch_metric_alarm.api_cpu.alarm_actions) == 0,
+      length(aws_cloudwatch_metric_alarm.api_memory.alarm_actions) == 0,
       length(aws_cloudwatch_metric_alarm.api_alb_5xx.alarm_actions) == 0,
       length(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.alarm_actions) == 0,
       length(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.alarm_actions) == 0,
@@ -157,14 +159,127 @@ run "release_contracts" {
   }
 
   assert {
+    condition = (
+      length(jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement) == 1 &&
+      toset(keys(jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0])) == toset(["Action", "Condition", "Effect", "Principal"]) &&
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Effect == "Allow" &&
+      toset(keys(jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Principal)) == toset(["Federated"]) &&
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Principal.Federated == data.aws_iam_openid_connect_provider.github_actions.arn &&
+      toset(keys(jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition)) == toset(["StringEquals"]) &&
+      toset(keys(jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition.StringEquals)) == toset([
+        "token.actions.githubusercontent.com:aud",
+        "token.actions.githubusercontent.com:sub",
+      ]) &&
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com" &&
+      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:${var.github_repository}:environment:${var.environment}"
+    )
+    error_message = "Staging OIDC trust must contain only the exact environment-scoped GitHub statement."
+  }
+
+  assert {
+    condition = (
+      length(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement) == 7 &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[0])) == toset(["Action", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[0].Action == "ecr:GetAuthorizationToken" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[0].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[0].Resource == "*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1])) == toset(["Action", "Effect", "Resource"]) &&
+      toset(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1].Action) == toset([
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeImages",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart",
+      ]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1].Resource == aws_ecr_repository.api.arn &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[2])) == toset(["Action", "Effect", "Resource"]) &&
+      toset(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[2].Action) == toset(["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[2].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[2].Resource == "*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3])) == toset(["Action", "Effect", "Resource"]) &&
+      toset(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Action) == toset(["ecs:DescribeServices", "ecs:UpdateService"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Resource == aws_ecs_service.api.id &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Action == "ecs:RunTask" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.api.family}:*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Condition)) == toset(["ArnEquals"]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Condition.ArnEquals)) == toset(["ecs:cluster"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Condition.ArnEquals["ecs:cluster"] == aws_ecs_cluster.main.arn &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5])) == toset(["Action", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5].Action == "ecs:DescribeTasks" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5].Effect == "Allow" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Action == "iam:PassRole" &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Effect == "Allow" &&
+      toset(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Resource) == toset([aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Condition)) == toset(["StringEquals"]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Condition.StringEquals)) == toset(["iam:PassedToService"]) &&
+      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[6].Condition.StringEquals["iam:PassedToService"] == "ecs-tasks.amazonaws.com"
+    )
+    error_message = "Staging deployment IAM must contain exactly the reviewed action, resource, and condition pairings."
+  }
+}
+
+run "alarm_action_override" {
+  command = apply
+
+  variables {
+    acm_certificate_arn = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    alarm_action_arns   = ["arn:aws:sns:ap-northeast-2:123456789012:dadamjang-staging-alerts"]
+    api_hostname        = "api.staging.example.test"
+  }
+
+  assert {
     condition = alltrue([
-      jsondecode(aws_iam_role.github_api_deploy.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:${var.github_repository}:environment:${var.environment}",
-      alltrue([for action in ["ecr:DescribeImages", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"] : contains(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[1].Action, action)]),
-      contains(jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Action, "ecs:UpdateService"),
-      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[3].Resource == aws_ecs_service.api.id,
-      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[4].Condition.ArnEquals["ecs:cluster"] == aws_ecs_cluster.main.arn,
-      jsondecode(aws_iam_role_policy.github_api_deploy.policy).Statement[5].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*",
+      toset(aws_cloudwatch_metric_alarm.api_cpu.alarm_actions) == var.alarm_action_arns,
+      toset(aws_cloudwatch_metric_alarm.api_memory.alarm_actions) == var.alarm_action_arns,
+      toset(aws_cloudwatch_metric_alarm.api_alb_5xx.alarm_actions) == var.alarm_action_arns,
+      toset(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.alarm_actions) == var.alarm_action_arns,
+      toset(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.alarm_actions) == var.alarm_action_arns,
     ])
-    error_message = "Staging deployment IAM must remain environment- and resource-scoped."
+    error_message = "Every staging alarm must receive a non-empty alarm action override."
+  }
+
+  assert {
+    condition = (
+      toset(keys(aws_cloudwatch_metric_alarm.api_cpu.dimensions)) == toset(["ClusterName", "ServiceName"]) &&
+      aws_cloudwatch_metric_alarm.api_cpu.dimensions.ClusterName == aws_ecs_cluster.main.name &&
+      aws_cloudwatch_metric_alarm.api_cpu.dimensions.ServiceName == aws_ecs_service.api.name &&
+      toset(keys(aws_cloudwatch_metric_alarm.api_memory.dimensions)) == toset(["ClusterName", "ServiceName"]) &&
+      aws_cloudwatch_metric_alarm.api_memory.dimensions.ClusterName == aws_ecs_cluster.main.name &&
+      aws_cloudwatch_metric_alarm.api_memory.dimensions.ServiceName == aws_ecs_service.api.name &&
+      toset(keys(aws_cloudwatch_metric_alarm.api_alb_5xx.dimensions)) == toset(["LoadBalancer"]) &&
+      aws_cloudwatch_metric_alarm.api_alb_5xx.dimensions.LoadBalancer == aws_lb.api.arn_suffix &&
+      toset(keys(aws_cloudwatch_metric_alarm.api_unhealthy_hosts.dimensions)) == toset(["LoadBalancer", "TargetGroup"]) &&
+      aws_cloudwatch_metric_alarm.api_unhealthy_hosts.dimensions.LoadBalancer == aws_lb.api.arn_suffix &&
+      aws_cloudwatch_metric_alarm.api_unhealthy_hosts.dimensions.TargetGroup == aws_lb_target_group.api.arn_suffix &&
+      toset(keys(aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.dimensions)) == toset(["LoadBalancer", "TargetGroup"]) &&
+      aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.dimensions.LoadBalancer == aws_lb.api.arn_suffix &&
+      aws_cloudwatch_metric_alarm.api_zero_healthy_hosts.dimensions.TargetGroup == aws_lb_target_group.api.arn_suffix
+    )
+    error_message = "Staging alarms must keep their exact ECS and ALB dimension values."
+  }
+}
+
+run "final_snapshot_identifier_override" {
+  command = apply
+
+  variables {
+    acm_certificate_arn       = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    api_hostname              = "api.staging.example.test"
+    final_snapshot_identifier = "dadamjang-reviewed-final"
+  }
+
+  assert {
+    condition     = aws_db_instance.main.final_snapshot_identifier == "dadamjang-reviewed-final"
+    error_message = "Staging RDS must preserve an explicit final snapshot identifier override."
   }
 }

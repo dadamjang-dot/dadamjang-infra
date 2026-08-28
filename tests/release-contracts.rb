@@ -155,6 +155,16 @@ check.call("infra CI runs native contracts for staging and e2e") do
   assert.call(step_named.call(validate, "Test e2e Terraform release contracts").fetch("run") == "terraform -chdir=terraform/e2e test", "e2e native contracts are not run")
 end
 
+check.call("staging ECS service waits for the HTTPS listener") do
+  graph, error, status = Open3.capture3("terraform", "-chdir=terraform/staging", "graph", "-type=plan", chdir: root)
+  assert.call(status.success?, error)
+  edges = graph.lines.map { |line| line.match(/^\s*"([^"]+)" -> "([^"]+)"/)&.captures }.compact
+  assert.call(
+    edges.include?(["[root] aws_ecs_service.api (expand)", "[root] aws_lb_listener.https (expand)"]),
+    "staging ECS service does not depend on the HTTPS listener",
+  )
+end
+
 check.call("privileged workflows execute only commit-pinned actions") do
   {
     ".github/workflows/api-deploy.yml" => workflow,
