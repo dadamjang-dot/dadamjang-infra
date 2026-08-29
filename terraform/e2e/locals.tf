@@ -1,6 +1,12 @@
 locals {
-  database_name = "dadamjang_e2e"
-  name_prefix   = "${var.project_name}-e2e"
+  database_name          = "dadamjang_e2e"
+  name_prefix            = "${var.project_name}-e2e"
+  pending_r2_bucket_name = "${local.name_prefix}-pending"
+
+  r2_application_bucket_names = toset([
+    var.cloudflare_r2_final_bucket_name,
+    local.pending_r2_bucket_name,
+  ])
 
   common_tags = {
     Environment = "e2e"
@@ -15,6 +21,7 @@ locals {
     "CLOUDFLARE_R2_ACCESS_KEY_ID",
     "CLOUDFLARE_R2_BUCKET",
     "CLOUDFLARE_R2_ENDPOINT",
+    "CLOUDFLARE_R2_PENDING_BUCKET",
     "CLOUDFLARE_R2_PUBLIC_BASE_URL",
     "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
     "DADAMJANG_BO_URL",

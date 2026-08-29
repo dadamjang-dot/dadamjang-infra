@@ -8,6 +8,16 @@ output "api_runtime_secret_arn" {
   value       = aws_secretsmanager_secret.api_runtime.arn
 }
 
+output "pending_r2_bucket_name" {
+  description = "Private one-day staging bucket required as CLOUDFLARE_R2_PENDING_BUCKET."
+  value       = cloudflare_r2_bucket.pending.name
+}
+
+output "r2_application_bucket_names" {
+  description = "Exact final and pending bucket scope for the application R2 S3 credential."
+  value       = sort(tolist(local.r2_application_bucket_names))
+}
+
 output "api_url" {
   description = "Public HTTPS endpoint for the staging API."
   value       = "https://${var.api_hostname}"

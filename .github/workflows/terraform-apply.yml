@@ -15,14 +15,20 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ROLE_ARN: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_TERRAFORM_API_TOKEN }}
       TF_BACKEND_CONFIG: ${{ secrets.TF_BACKEND_CONFIG }}
       TF_VAR_acm_certificate_arn: ${{ vars.ACM_CERTIFICATE_ARN }}
       TF_VAR_api_hostname: ${{ vars.API_HOSTNAME }}
+      TF_VAR_cloudflare_account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_cloudflare_r2_final_bucket_name: ${{ vars.CLOUDFLARE_R2_FINAL_BUCKET_NAME }}
     steps:
       - name: Validate Terraform inputs
         run: |
           : "${TF_VAR_acm_certificate_arn:?ACM_CERTIFICATE_ARN is required}"
           : "${TF_VAR_api_hostname:?API_HOSTNAME is required}"
+          : "${TF_VAR_cloudflare_account_id:?CLOUDFLARE_ACCOUNT_ID is required}"
+          : "${TF_VAR_cloudflare_r2_final_bucket_name:?CLOUDFLARE_R2_FINAL_BUCKET_NAME is required}"
+          : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_TERRAFORM_API_TOKEN is required}"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:

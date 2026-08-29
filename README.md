@@ -48,6 +48,9 @@ terraform validate
 terraform login app.terraform.io
 export TF_VAR_acm_certificate_arn="arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
 export TF_VAR_api_hostname="api.staging.example.com"
+export TF_VAR_cloudflare_account_id="00000000000000000000000000000000"
+export TF_VAR_cloudflare_r2_final_bucket_name="dadamjang-staging"
+export CLOUDFLARE_API_TOKEN="replace-with-a-short-lived-token"
 terraform init -reconfigure -backend-config=backend.hcl
 terraform plan -input=false
 ```
@@ -102,8 +105,11 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_ECS_SERVICE` | Variable | `ecs_service_name` |
 | `ACM_CERTIFICATE_ARN` | Variable | staging HTTPS listener 인증서 ARN |
 | `API_HOSTNAME` | Variable | staging API DNS hostname |
+| `CLOUDFLARE_ACCOUNT_ID` | Variable | staging R2 bucket을 소유한 Cloudflare account ID |
+| `CLOUDFLARE_R2_FINAL_BUCKET_NAME` | Variable | 승격 완료 이미지를 보관하는 기존 final bucket 이름 |
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
+| `CLOUDFLARE_TERRAFORM_API_TOKEN` | Secret | pending bucket 관리 전용 Cloudflare API token |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
 | `HCP_TERRAFORM_PLAN_TOKEN` | Secret | staging state read/write와 lock/unlock으로 제한한 plan team API token |
 | `HCP_TERRAFORM_OUTPUT_TOKEN` | Secret | plan token과 구분한 staging output read-only team API token |
@@ -121,6 +127,8 @@ AWS_ECS_CLUSTER=dadamjang-staging-cluster
 AWS_ECS_SERVICE=dadamjang-staging-api
 ACM_CERTIFICATE_ARN=arn:aws:acm:ap-northeast-2:123456789012:certificate/example
 API_HOSTNAME=api.staging.example.com
+CLOUDFLARE_ACCOUNT_ID=00000000000000000000000000000000
+CLOUDFLARE_R2_FINAL_BUCKET_NAME=dadamjang-staging
 ```
 
 아래 secrets는 실제 AWS 계정과 원격 Terraform backend 값이 있어야 등록할 수 있다.
@@ -128,6 +136,7 @@ API_HOSTNAME=api.staging.example.com
 ```txt
 AWS_API_DEPLOY_ROLE_ARN
 AWS_TERRAFORM_ROLE_ARN
+CLOUDFLARE_TERRAFORM_API_TOKEN
 TF_BACKEND_CONFIG
 HCP_TERRAFORM_PLAN_TOKEN
 HCP_TERRAFORM_OUTPUT_TOKEN
@@ -160,6 +169,7 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
   "CLOUDFLARE_R2_ACCESS_KEY_ID": "replace-me",
   "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "replace-me",
   "CLOUDFLARE_R2_BUCKET": "dadamjang-staging",
+  "CLOUDFLARE_R2_PENDING_BUCKET": "dadamjang-staging-pending",
   "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://images.example.com",
   "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://images.example.com/cdn-cgi/image",
   "SENTRY_DSN": "https://<public-key>@<sentry-host>/<project-id>"
@@ -183,7 +193,9 @@ aws secretsmanager put-secret-value \
   --secret-string file://runtime-secrets.json
 ```
 
-Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public delivery base URL, Cloudflare Images transform base URL을 만든다. Cloudflare access key, secret key, account endpoint는 GitHub secret이 아니라 위 AWS Secrets Manager JSON에만 저장한다.
+Terraform은 `${project_name}-${environment}-pending` R2 bucket을 final bucket과 구분해 만들고 모든 object에 86,400초(1일) 삭제 lifecycle을 적용한다. 이 pending bucket의 `r2.dev` managed domain은 비활성화하며 어떤 public/custom domain도 연결하지 않는다. `CLOUDFLARE_R2_PENDING_BUCKET` 값은 `pending_r2_bucket_name` output과 정확히 같아야 한다. 기존 final bucket은 이 root가 새로 소유하지 않는다.
+
+`CLOUDFLARE_TERRAFORM_API_TOKEN`은 pending bucket, lifecycle, managed-domain 상태를 관리하는 `Workers R2 Storage Write` 권한만 가진 짧은 수명의 별도 운영 token으로 둔다. 애플리케이션용 R2 S3 credential은 Object Read & Write 권한을 output `r2_application_bucket_names`의 exact final+pending 두 bucket에만 scope한다. 해당 access key, secret key, account endpoint는 GitHub secret이나 Terraform state가 아니라 위 AWS Secrets Manager JSON에만 저장하며, Terraform 관리 token과 재사용하지 않는다. Final bucket의 public delivery base URL과 Cloudflare Images transform base URL은 pending bucket에 적용하지 않는다.
 
 ## GitHub Actions
 

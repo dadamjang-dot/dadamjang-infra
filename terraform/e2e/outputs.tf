@@ -57,3 +57,13 @@ output "api_security_group_id" {
   description = "Security group ID for the one-off e2e reset task."
   value       = aws_security_group.api.id
 }
+
+output "pending_r2_bucket_name" {
+  description = "Private one-day e2e bucket required as CLOUDFLARE_R2_PENDING_BUCKET."
+  value       = cloudflare_r2_bucket.pending.name
+}
+
+output "r2_application_bucket_names" {
+  description = "Exact final and pending bucket scope for the e2e application R2 S3 credential."
+  value       = sort(tolist(local.r2_application_bucket_names))
+}

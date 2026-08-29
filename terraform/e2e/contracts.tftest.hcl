@@ -52,6 +52,8 @@ mock_provider "aws" {
   }
 }
 
+mock_provider "cloudflare" {}
+
 run "release_contracts" {
   command = apply
 
@@ -70,8 +72,33 @@ run "release_contracts" {
   }
 
   variables {
-    acm_certificate_arn = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
-    api_hostname        = "api.e2e.example.test"
+    acm_certificate_arn             = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    api_hostname                    = "api.e2e.example.test"
+    cloudflare_account_id           = "00000000000000000000000000000000"
+    cloudflare_r2_final_bucket_name = "dadamjang-e2e-final"
+  }
+
+  assert {
+    condition = alltrue([
+      cloudflare_r2_bucket.pending.account_id == var.cloudflare_account_id,
+      cloudflare_r2_bucket.pending.name == "dadamjang-e2e-pending",
+      cloudflare_r2_bucket.pending.name != var.cloudflare_r2_final_bucket_name,
+      cloudflare_r2_bucket.pending.location == "apac",
+      cloudflare_r2_bucket.pending.storage_class == "Standard",
+      cloudflare_r2_bucket_lifecycle.pending.bucket_name == cloudflare_r2_bucket.pending.name,
+      cloudflare_r2_bucket_lifecycle.pending.rules[0].enabled,
+      cloudflare_r2_bucket_lifecycle.pending.rules[0].conditions.prefix == "",
+      cloudflare_r2_bucket_lifecycle.pending.rules[0].delete_objects_transition.condition.type == "Age",
+      cloudflare_r2_bucket_lifecycle.pending.rules[0].delete_objects_transition.condition.max_age == 86400,
+      cloudflare_r2_managed_domain.pending.bucket_name == cloudflare_r2_bucket.pending.name,
+      !cloudflare_r2_managed_domain.pending.enabled,
+      output.pending_r2_bucket_name == cloudflare_r2_bucket.pending.name,
+      output.r2_application_bucket_names == sort([
+        var.cloudflare_r2_final_bucket_name,
+        cloudflare_r2_bucket.pending.name,
+      ]),
+    ])
+    error_message = "The e2e pending R2 bucket must be distinct, private, and expire objects after one day."
   }
 
   assert {
@@ -189,7 +216,7 @@ run "release_contracts" {
   assert {
     condition = sort(tolist(local.runtime_secret_keys)) == sort([
       "API_PUBLIC_BASE_URL", "CLIENT_URL", "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL", "CLOUDFLARE_R2_ACCESS_KEY_ID",
-      "CLOUDFLARE_R2_BUCKET", "CLOUDFLARE_R2_ENDPOINT", "CLOUDFLARE_R2_PUBLIC_BASE_URL", "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
+      "CLOUDFLARE_R2_BUCKET", "CLOUDFLARE_R2_ENDPOINT", "CLOUDFLARE_R2_PENDING_BUCKET", "CLOUDFLARE_R2_PUBLIC_BASE_URL", "CLOUDFLARE_R2_SECRET_ACCESS_KEY",
       "DADAMJANG_BO_URL", "EMAIL_CODE_PEPPER", "IDENTITY_CI_PEPPER", "IDENTITY_INICIS_API_KEY",
       "IDENTITY_INICIS_CALLBACK_BASE_URL", "IDENTITY_INICIS_MID", "IDENTITY_INICIS_SEED_IV", "JWT_ACCESS_TOKEN_EXP",
       "JWT_ACCESS_TOKEN_SECRET", "JWT_REFRESH_TOKEN_EXP", "JWT_REFRESH_TOKEN_SECRET", "KAKAO_CALLBACK_URL",
@@ -197,4 +224,24 @@ run "release_contracts" {
     ])
     error_message = "The e2e runtime secret contract must match staging."
   }
+
+  assert {
+    condition = sort([
+      for secret in jsondecode(aws_ecs_task_definition.api.container_definitions)[0].secrets : secret.name
+    ]) == sort(concat(["POSTGRES_PASSWORD"], tolist(local.runtime_secret_keys)))
+    error_message = "The e2e task secret set must exactly match the reviewed runtime contract."
+  }
+}
+
+run "reject_shared_final_and_pending_bucket" {
+  command = plan
+
+  variables {
+    acm_certificate_arn             = "arn:aws:acm:ap-northeast-2:123456789012:certificate/00000000-0000-0000-0000-000000000000"
+    api_hostname                    = "api.e2e.example.test"
+    cloudflare_account_id           = "00000000000000000000000000000000"
+    cloudflare_r2_final_bucket_name = "dadamjang-e2e-pending"
+  }
+
+  expect_failures = [cloudflare_r2_bucket.pending]
 }

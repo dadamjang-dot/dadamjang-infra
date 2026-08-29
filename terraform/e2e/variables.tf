@@ -38,6 +38,26 @@ variable "aws_region" {
   default     = "ap-northeast-2"
 }
 
+variable "cloudflare_account_id" {
+  description = "Cloudflare account that owns the isolated e2e R2 buckets."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{32}$", var.cloudflare_account_id))
+    error_message = "cloudflare_account_id must be a lowercase 32-character Cloudflare account ID."
+  }
+}
+
+variable "cloudflare_r2_final_bucket_name" {
+  description = "Existing e2e R2 bucket containing promoted final images."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", var.cloudflare_r2_final_bucket_name))
+    error_message = "cloudflare_r2_final_bucket_name must be a valid lowercase R2 bucket name."
+  }
+}
+
 variable "database_instance_class" {
   description = "RDS instance class for e2e PostgreSQL."
   type        = string
