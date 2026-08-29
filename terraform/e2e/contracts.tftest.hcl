@@ -129,37 +129,41 @@ run "release_contracts" {
   }
 
   assert {
+    condition = length([
+      for statement in jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement : statement
+      if try(contains(tolist(statement.Action), "ecs:DescribeTaskDefinition"), statement.Action == "ecs:DescribeTaskDefinition")
+    ]) == 0
+    error_message = "Mobile E2E IAM must not grant the unused ecs:DescribeTaskDefinition action."
+  }
+
+  assert {
     condition = try(
       toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy))) == toset(["Statement", "Version"]) &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Version == "2012-10-17" &&
-      length(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement) == 5 &&
+      length(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement) == 4 &&
       toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[0])) == toset(["Action", "Effect", "Resource"]) &&
       toset(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[0].Action) == toset(["ecs:DescribeServices", "ecs:UpdateService"]) &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[0].Effect == "Allow" &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[0].Resource == aws_ecs_service.api.id &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1])) == toset(["Action", "Effect", "Resource"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Action == "ecs:DescribeTaskDefinition" &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Action == "ecs:RunTask" &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Effect == "Allow" &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Resource == "*" &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Action == "ecs:RunTask" &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.api.family}:*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Condition)) == toset(["ArnEquals"]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Condition.ArnEquals)) == toset(["ecs:cluster"]) &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[1].Condition.ArnEquals["ecs:cluster"] == aws_ecs_cluster.main.arn &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2])) == toset(["Action", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Action == "ecs:DescribeTasks" &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Effect == "Allow" &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task-definition/${aws_ecs_task_definition.api.family}:*" &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Condition)) == toset(["ArnEquals"]) &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Condition.ArnEquals)) == toset(["ecs:cluster"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Condition.ArnEquals["ecs:cluster"] == aws_ecs_cluster.main.arn &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3])) == toset(["Action", "Effect", "Resource"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Action == "ecs:DescribeTasks" &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[2].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*" &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Action == "iam:PassRole" &&
       jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Effect == "Allow" &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Resource == "arn:${data.aws_partition.current.partition}:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:task/${aws_ecs_cluster.main.name}/*" &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4])) == toset(["Action", "Condition", "Effect", "Resource"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Action == "iam:PassRole" &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Effect == "Allow" &&
-      length(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Resource) == 2 &&
-      toset(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Resource) == toset([aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn]) &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Condition)) == toset(["StringEquals"]) &&
-      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Condition.StringEquals)) == toset(["iam:PassedToService"]) &&
-      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[4].Condition.StringEquals["iam:PassedToService"] == "ecs-tasks.amazonaws.com",
+      length(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Resource) == 2 &&
+      toset(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Resource) == toset([aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Condition)) == toset(["StringEquals"]) &&
+      toset(keys(jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Condition.StringEquals)) == toset(["iam:PassedToService"]) &&
+      jsondecode(aws_iam_role_policy.mobile_e2e.policy).Statement[3].Condition.StringEquals["iam:PassedToService"] == "ecs-tasks.amazonaws.com",
       false,
     )
     error_message = "Mobile E2E IAM must contain exactly the reviewed ECS lifecycle and PassRole permissions."

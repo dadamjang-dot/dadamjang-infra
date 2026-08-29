@@ -78,11 +78,6 @@ locals {
         Resource = aws_ecs_service.api.id
       },
       {
-        Action   = "ecs:DescribeTaskDefinition"
-        Effect   = "Allow"
-        Resource = "*"
-      },
-      {
         Action    = "ecs:RunTask"
         Condition = { ArnEquals = { "ecs:cluster" = aws_ecs_cluster.main.arn } }
         Effect    = "Allow"

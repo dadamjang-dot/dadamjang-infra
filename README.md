@@ -52,9 +52,9 @@ terraform init -reconfigure -backend-config=backend.hcl
 terraform plan -input=false
 ```
 
-CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. Apply 자동화는 아직 제공하지 않는다. 향후 apply는 동일한 저장 plan을 별도 보호 승인 뒤 소비하는 계약으로 구현하거나, 그 전까지는 plan 생성·검토·apply를 하나의 통제된 out-of-band 수동 절차에서 수행한다.
+CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. 현재 Apply는 지원하지 않는다. 보호 승인 뒤 정확히 동일한 저장 plan을 소비하고 API deploy와 같은 `staging-api-deploy` concurrency group을 공유하는 apply job이 구현될 때까지 apply는 unavailable이며, 로컬이나 외부 절차로 우회해서는 안 된다.
 
-상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 원격 backend를 사용한다. `TF_BACKEND_CONFIG` GitHub Environment secret에는 비자격증명 backend 설정만 HCL로 넣고, HCP 인증은 별도의 `HCP_TERRAFORM_TOKEN` Environment secret으로 제공한다.
+상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 원격 backend를 사용한다. `TF_BACKEND_CONFIG` GitHub Environment secret에는 비자격증명 backend 설정만 HCL로 넣고, plan과 API output 조회는 서로 다른 HCP Terraform Environment secret으로 인증한다.
 
 ```hcl
 # 예: HCP Terraform remote backend 설정
@@ -66,9 +66,9 @@ workspaces {
 }
 ```
 
-staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. CI는 staging workspace 작업에 필요한 최소 권한만 부여한 team API token을 보호된 `HCP_TERRAFORM_TOKEN`으로 저장하고 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달해 Terraform CLI credentials를 구성한다. Organization API token과 agent token은 CI 인증에 사용하지 않는다. Team API token에는 가능한 가장 짧은 만료 시간을 설정하고 저장소 운영 담당자가 만료 전 rotation을 책임진다. 로컬의 `terraform login app.terraform.io`는 개발자 개인의 user API token을 별도로 구성한다. 토큰은 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. `terraform-apply.yml`은 staging workspace의 local plan에 필요한 state read/write와 lock/unlock으로 제한한 team API token을 `HCP_TERRAFORM_PLAN_TOKEN`으로 사용한다. `api-deploy.yml`은 별도의 output read-only team API token을 `HCP_TERRAFORM_OUTPUT_TOKEN`으로 사용하며 두 secret에 같은 token을 등록하지 않는다. Organization API token과 agent token은 CI 인증에 사용하지 않는다. 두 team token에는 가능한 가장 짧은 만료 시간을 설정한다. 인프라 운영 담당자는 plan token을, API 배포 운영 담당자는 output token을 소유하고 만료 전에 독립적으로 rotation한다. 로컬의 `terraform login app.terraform.io`는 개발자 개인의 user API token을 별도로 구성한다. Token은 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달하며 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact, shell command, log에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
-첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
+향후 보호된 apply job의 첫 실행은 ECS service를 `desired_count = 0`으로 만들어야 한다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
 ALB health check는 인증 없이 정확히 `200`을 반환하는 backend readiness endpoint `/health/ready`를 사용한다. rollout 전에 배포 대상 backend commit이 이 endpoint를 제공하는지 확인한다.
 
@@ -78,7 +78,7 @@ ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/
 
 ### staging RDS safe destroy
 
-staging RDS는 기본적으로 `enable_deletion_protection=true`, `skip_final_snapshot=false`다. 삭제가 필요하면 먼저 deletion protection만 `false`로 apply하고, final snapshot을 남긴 채 destroy한다. `final_snapshot_identifier`를 지정하지 않으면 `dadamjang-staging-postgres-final`을 사용한다.
+staging RDS는 기본적으로 `enable_deletion_protection=true`, `skip_final_snapshot=false`다. 보호된 same-plan apply job이 제공된 이후 삭제가 필요하면 먼저 deletion protection만 `false`로 반영하고, final snapshot을 남긴 채 destroy한다. `final_snapshot_identifier`를 지정하지 않으면 `dadamjang-staging-postgres-final`을 사용한다.
 
 같은 identifier의 snapshot이 이미 있으면 destroy가 실패한다. 보관할 snapshot에는 고유한 `final_snapshot_identifier` override를 지정한다. 기존 snapshot이 불필요함을 확인한 경우에만 다음 명령으로 수동 삭제한 뒤 다시 destroy한다.
 
@@ -91,7 +91,7 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 ## AWS 사전 준비
 
 1. AWS 계정에서 GitHub Actions OIDC provider `https://token.actions.githubusercontent.com`를 1회 생성한다. Terraform의 `data.aws_iam_openid_connect_provider.github_actions`가 이를 참조한다.
-2. AWS 자격 증명으로 Terraform을 1회 apply한다. 계정 ID는 코드에 넣지 않는다.
+2. 보호된 same-plan apply job이 제공된 이후에만 초기 Terraform provisioning을 진행한다. 현재 저장소에는 실행 가능한 초기 apply 경로가 없다. 계정 ID는 코드에 넣지 않는다.
 3. output에서 아래 값을 GitHub `dadamjang-dot/dadamjang-infra`의 `staging` Environment에 등록한다.
 
 | 이름 | 종류 | 값 |
@@ -105,9 +105,10 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
-| `HCP_TERRAFORM_TOKEN` | Secret | staging workspace 최소 권한으로 제한한 HCP Terraform team API token |
+| `HCP_TERRAFORM_PLAN_TOKEN` | Secret | staging state read/write와 lock/unlock으로 제한한 plan team API token |
+| `HCP_TERRAFORM_OUTPUT_TOKEN` | Secret | plan token과 구분한 staging output read-only team API token |
 
-API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform apply와 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
+API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform plan과 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
 
 CloudWatch alarm 알림을 사용하려면 먼저 SNS topic과 subscription을 별도로 만들고 SNS topic ARN을 Terraform의 `alarm_action_arns`에 전달한다. 기본값은 빈 set이며 이 root는 SNS resource를 만들지 않는다.
 
@@ -128,7 +129,8 @@ API_HOSTNAME=api.staging.example.com
 AWS_API_DEPLOY_ROLE_ARN
 AWS_TERRAFORM_ROLE_ARN
 TF_BACKEND_CONFIG
-HCP_TERRAFORM_TOKEN
+HCP_TERRAFORM_PLAN_TOKEN
+HCP_TERRAFORM_OUTPUT_TOKEN
 ```
 
 ## API runtime secrets
@@ -164,13 +166,13 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
 }
 ```
 
-새 task definition을 등록하기 전에 위 JSON의 모든 key를 실제 값으로 새 secret version에 등록해야 한다. Terraform은 JSON 값이 아니라 key별 ECS 참조만 추가하므로, 누락된 key가 있으면 새 task가 시작되지 않는다. OIDC trust 변경을 먼저 Terraform apply한 뒤 API deploy를 실행한다.
+새 task definition을 등록하기 전에 위 JSON의 모든 key를 실제 값으로 새 secret version에 등록해야 한다. Terraform은 JSON 값이 아니라 key별 ECS 참조만 추가하므로, 누락된 key가 있으면 새 task가 시작되지 않는다. OIDC trust 변경은 보호된 apply job이 제공되기 전에는 반영할 수 없으며, 반영 전 API deploy를 실행하지 않는다.
 
 rollout 전에는 다음 조건을 모두 충족한다.
 
 - 배포 대상 backend가 `/health/ready`에서 인증 없이 `200`을 반환한다.
 - staging과 e2e Secrets Manager JSON에 `SENTRY_DSN`을 포함한 `local.runtime_secret_keys`의 exact key set과 실제 값을 등록한다.
-- 새 task environment, secret reference, alarm 설정을 Terraform apply한 뒤 immutable image deploy를 실행한다.
+- 새 task environment, secret reference, alarm 설정은 보호된 apply job으로 반영한 뒤 immutable image deploy를 실행한다.
 - alarm 알림을 켤 경우 `alarm_action_arns`가 가리키는 SNS topic ARN과 subscription을 미리 만든다.
 
 예시 JSON을 실제 값으로 저장한 뒤 다음처럼 등록한다.
@@ -195,7 +197,7 @@ API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Ima
 
 `ecs_release_contract`는 Terraform이 만든 canonical task definition, apply 시점에 refresh한 ECS service의 exact task-definition revision, ECR repository, runtime secret 이름, task-contract source hash를 하나로 묶는다. API deploy는 live service의 exact revision을 읽고 canonical contract를 엄격히 검증한 다음 canonical definition에서 새 digest와 `SENTRY_RELEASE`만 바꿔 등록한다. Live contract가 canonical과 이미 같으면 일반 image-only deploy로 진행한다. Contract가 다르면 live revision이 Terraform apply가 관측한 revision과 정확히 같을 때만 한 번의 contract transition을 허용한다. 따라서 service drift나 다른 infra commit의 stale state는 자동 승인되지 않는다.
 
-기존 staging에 이 output 또는 새 runtime contract를 처음 적용할 때는 secrets를 먼저 준비하고, 통제된 out-of-band 절차에서 같은 infra commit으로 staging Terraform plan을 생성·검토한 뒤 그 저장 plan을 수동 apply한다. 이 apply는 `ignore_changes = [task_definition]` 때문에 mutable/placeholder image로 service를 재배포하지 않고 새 canonical revision과 현재 service revision을 state에 기록한다. 그 다음 같은 commit의 API deploy를 실행하면 immutable digest를 사용해 canonical contract로 전환한다. 이후 image-only deploy는 별도 Terraform apply가 필요 없으며, 미래 runtime contract 변경에는 같은 plan 검토와 수동 apply → API deploy 순서를 반복한다. Apply 이후 live revision이 예상과 다르면 drift를 조사·복구한 뒤 새 plan을 검토해야 하며 state만 다시 승인해서는 안 된다.
+기존 staging output 또는 새 runtime contract의 Terraform 변경은 현재 적용할 수 없다. 로컬이나 외부 실행으로 우회하지 않는다. 향후 apply job은 `staging` Environment 승인 아래 검토된 정확히 동일한 저장 plan만 소비하고 API deploy의 `staging-api-deploy` concurrency group을 공유해 canonical-contract 관측부터 service 갱신까지의 경계와 직렬화되어야 한다. 이 경로가 구현되고 성공한 뒤에만 같은 infra commit의 API deploy를 허용한다. Live revision이 예상과 다르면 drift를 조사·복구하고 새 plan부터 다시 검토하며 state만 다시 승인해서는 안 된다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

@@ -310,39 +310,36 @@ check.call("Terraform backend contracts exclude unsupported execution settings")
 end
 
 check.call("HCP Terraform credentials stay outside backend configuration and plans") do
-  hcp_token_secret = "${{ secrets.HCP_TERRAFORM_TOKEN }}"
+  terraform_job = terraform_apply.fetch("jobs").fetch("terraform")
   terraform_jobs = {
-    ".github/workflows/api-deploy.yml" => deploy_job,
-    ".github/workflows/terraform-apply.yml" => terraform_apply.fetch("jobs").fetch("terraform"),
+    ".github/workflows/api-deploy.yml" => [deploy_job, "${{ secrets.HCP_TERRAFORM_OUTPUT_TOKEN }}"],
+    ".github/workflows/terraform-apply.yml" => [terraform_job, "${{ secrets.HCP_TERRAFORM_PLAN_TOKEN }}"],
   }
+  hcp_token_name = /HCP_TERRAFORM(?:_(?:PLAN|OUTPUT))?_TOKEN/
 
-  terraform_jobs.each do |path, job|
+  terraform_jobs.each do |path, (job, token_secret)|
     setup_steps = job.fetch("steps").select { |step| uses_action.call(step, "hashicorp/setup-terraform") }
     assert.call(setup_steps.length == 1, "#{path} must have exactly one Terraform setup step")
-    setup_token = setup_steps.first.dig("with", "cli_config_credentials_token")
-    assert.call(setup_token == hcp_token_secret, "#{path} does not inject the protected HCP token through Terraform CLI credentials")
-    setup_hostname = setup_steps.first.dig("with", "cli_config_credentials_hostname")
-    assert.call(setup_hostname == "app.terraform.io", "#{path} configures Terraform credentials for the wrong hostname")
-    token_references = JSON.generate(job).scan(hcp_token_secret).length
-    assert.call(token_references == 1, "#{path} exposes the HCP token outside the Terraform CLI credential input")
-
+    setup = setup_steps.first
+    assert.call(setup.dig("with", "cli_config_credentials_hostname") == "app.terraform.io", "#{path} configures Terraform credentials for the wrong hostname")
+    assert.call(setup.dig("with", "cli_config_credentials_token") == token_secret, "#{path} injects the wrong HCP token")
+    assert.call(JSON.generate(job).scan(hcp_token_name).length == 1, "#{path} does not use exactly one isolated HCP token reference")
     backend_step = step_named.call(job, "Write Terraform backend configuration")
     backend_env = job.fetch("env", {}).merge(backend_step.fetch("env", {}))
-    backend_metadata = backend_env.fetch("TF_BACKEND_CONFIG")
-    assert.call(backend_metadata == "${{ secrets.TF_BACKEND_CONFIG }}", "#{path} does not keep backend metadata in its dedicated protected input")
-    assert.call(!backend_step.fetch("run").include?("HCP_TERRAFORM_TOKEN"), "#{path} writes the HCP token into backend.hcl")
+    assert.call(backend_env.fetch("TF_BACKEND_CONFIG") == "${{ secrets.TF_BACKEND_CONFIG }}", "#{path} does not keep backend metadata in its dedicated protected input")
     run_commands = job.fetch("steps").map { |step| step["run"] }.compact.join("\n")
-    assert.call(!run_commands.include?("HCP_TERRAFORM_TOKEN"), "#{path} exposes the HCP token to a shell command")
+    assert.call(!run_commands.match?(hcp_token_name), "#{path} exposes an HCP token to backend configuration, commands, or logs")
   end
 
-  terraform_job = terraform_jobs.fetch(".github/workflows/terraform-apply.yml")
   assert.call(terraform_job.dig("environment", "name") == "staging", "Terraform plan job is missing the protected staging environment")
   uploads_artifact = terraform_job.fetch("steps").any? { |step| uses_action.call(step, "actions/upload-artifact") }
   assert.call(!uploads_artifact, "Terraform workflow uploads a plan artifact that could retain backend data")
 
   readme = File.read(File.join(root, "README.md"))
-  assert.call(readme.include?("`HCP_TERRAFORM_TOKEN`"), "README omits the protected HCP token")
-  assert.call(readme.include?("`cli_config_credentials_token`"), "README omits the CI credential injection mechanism")
+  assert.call(readme.include?("`HCP_TERRAFORM_PLAN_TOKEN`") && readme.include?("state read/write와 lock/unlock"), "README omits the plan token boundary")
+  assert.call(readme.include?("`HCP_TERRAFORM_OUTPUT_TOKEN`") && readme.include?("output read-only"), "README omits the output token boundary")
+  assert.call(readme.include?("인프라 운영 담당자") && readme.include?("API 배포 운영 담당자") && readme.include?("독립적으로 rotation"), "README omits independent token ownership and rotation")
+  assert.call(!readme.include?("`HCP_TERRAFORM_TOKEN`"), "README retains the shared HCP token")
   assert.call(readme.include?("`terraform login app.terraform.io`"), "README omits separate local HCP authentication")
 end
 
@@ -398,6 +395,11 @@ check.call("Terraform workflow is plan-only with complete protected inputs") do
   assert.call(!workflow_commands.any? { |command| terraform_apply_command.call(command) }, "Terraform workflow can still apply an unreviewed plan")
   workflow_definition = JSON.generate(terraform_apply)
   assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
+  readme = File.read(File.join(root, "README.md"))
+  readme_bash = readme.scan(/```bash\n(.*?)\n```/m).flatten
+  assert.call(!readme_bash.any? { |commands| terraform_apply_command.call(commands) }, "README contains an executable Terraform apply command")
+  assert.call(!readme.include?("out-of-band 수동") && !readme.include?("수동 apply"), "README documents an unsupported manual apply procedure")
+  assert.call(readme.include?("Apply는 지원하지 않는다") && readme.include?("동일한 저장 plan") && readme.include?("staging-api-deploy"), "README omits the fail-closed future apply boundary")
 end
 
 check.call("staging ECS service waits for the HTTPS listener") do
