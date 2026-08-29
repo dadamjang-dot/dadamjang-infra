@@ -4,7 +4,6 @@ require "fileutils"
 require "digest"
 require "json"
 require "open3"
-require "shellwords"
 require "set"
 require "tmpdir"
 require "yaml"
@@ -70,24 +69,6 @@ end
 write_executable = lambda do |path, body|
   File.write(path, body)
   FileUtils.chmod(0o755, path)
-end
-
-terraform_apply_command = lambda do |command|
-  command.gsub(/\\\r?\n/, " ").lines.any? do |line|
-    tokens = Shellwords.shellsplit(line)
-    tokens.each_index.any? do |index|
-      next false unless tokens[index] == "terraform"
-
-      arguments = tokens[(index + 1)..-1] || []
-      while arguments.first&.start_with?("-")
-        option = arguments.shift
-        arguments.shift if option == "-chdir"
-      end
-      arguments.first == "apply"
-    end
-  rescue ArgumentError
-    false
-  end
 end
 
 docker_instructions = lambda do
@@ -233,16 +214,6 @@ check.call("infra CI runs native contracts for staging and e2e") do
   assert.call(step_named.call(validate, "Test e2e Terraform release contracts").fetch("run") == "terraform -chdir=terraform/e2e test", "e2e native contracts are not run")
 end
 
-check.call("Terraform owns private one-day pending R2 buckets") do
-  %w[staging e2e].each do |environment|
-    source = Dir[File.join(root, "terraform/#{environment}/*.tf")].map { |path| File.read(path) }.join("\n")
-    assert.call(source.match?(/resource\s+"cloudflare_r2_bucket"\s+"pending"/), "#{environment} omits the pending bucket")
-    assert.call(source.match?(/resource\s+"cloudflare_r2_bucket_lifecycle"\s+"pending"/), "#{environment} omits pending lifecycle ownership")
-    assert.call(source.match?(/resource\s+"cloudflare_r2_managed_domain"\s+"pending"/), "#{environment} omits managed-domain privacy ownership")
-    assert.call(!source.match?(/resource\s+"cloudflare_r2_custom_domain"/), "#{environment} exposes an R2 custom domain")
-  end
-end
-
 check.call("Terraform roots select remote state for partial backend configuration") do
   version_output, version_error, version_status = Open3.capture3("terraform", "version", "-json", chdir: root)
   assert.call(version_status.success?, version_error)
@@ -361,77 +332,6 @@ check.call("HCP Terraform credentials stay outside backend configuration and pla
   assert.call(readme.include?("인프라 운영 담당자") && readme.include?("API 배포 운영 담당자") && readme.include?("독립적으로 rotation"), "README omits independent token ownership and rotation")
   assert.call(!readme.include?("`HCP_TERRAFORM_TOKEN`"), "README retains the shared HCP token")
   assert.call(readme.include?("`terraform login app.terraform.io`"), "README omits separate local HCP authentication")
-end
-
-check.call("Terraform apply detection handles CLI global options") do
-  assert.call(
-    terraform_apply_command.call("terraform -chdir=terraform/staging apply -input=false staging.tfplan"),
-    "Terraform apply detection misses -chdir before the subcommand",
-  )
-  assert.call(
-    !terraform_apply_command.call("terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan"),
-    "Terraform apply detection rejects a plan command",
-  )
-end
-
-check.call("Terraform workflow is plan-only with complete protected inputs") do
-  triggers = terraform_apply["on"] || terraform_apply.fetch(true)
-  dispatch = triggers.fetch("workflow_dispatch") || {}
-  terraform_job = terraform_apply.fetch("jobs").fetch("terraform")
-  terraform_env = terraform_job.fetch("env")
-  assert.call((dispatch["inputs"] || {}).empty?, "Terraform workflow still exposes an apply mode")
-  assert.call(terraform_env.fetch("TF_VAR_acm_certificate_arn") == "${{ vars.ACM_CERTIFICATE_ARN }}", "ACM certificate ARN is not supplied to Terraform")
-  assert.call(terraform_env.fetch("TF_VAR_api_hostname") == "${{ vars.API_HOSTNAME }}", "API hostname is not supplied to Terraform")
-  assert.call(terraform_env.fetch("TF_VAR_cloudflare_account_id") == "${{ vars.CLOUDFLARE_ACCOUNT_ID }}", "Cloudflare account ID is not supplied to Terraform")
-  assert.call(terraform_env.fetch("TF_VAR_cloudflare_r2_final_bucket_name") == "${{ vars.CLOUDFLARE_R2_FINAL_BUCKET_NAME }}", "final R2 bucket name is not supplied to Terraform")
-  assert.call(terraform_env.fetch("CLOUDFLARE_API_TOKEN") == "${{ secrets.CLOUDFLARE_TERRAFORM_API_TOKEN }}", "Cloudflare provider token is not isolated")
-
-  validation = step_named.call(terraform_job, "Validate Terraform inputs")
-  initialization = step_named.call(terraform_job, "Initialize Terraform state backend")
-  assert.call(terraform_job.fetch("steps").index(validation) < terraform_job.fetch("steps").index(initialization), "Terraform inputs are not validated before initialization")
-  assert.call(
-    initialization.fetch("run").split.grep(/\A-backend-config=/) == ["-backend-config=backend.hcl"],
-    "Terraform plan passes unsupported inline backend configuration",
-  )
-  deploy_initialization = step_named.call(deploy_job, "Initialize Terraform state backend")
-  assert.call(
-    deploy_initialization.fetch("run").split.grep(/\A-backend-config=/) == ["-backend-config=backend.hcl"],
-    "release state reads pass unsupported inline backend configuration",
-  )
-  _, _, empty_status = Open3.capture3(
-    {
-      "CLOUDFLARE_API_TOKEN" => nil,
-      "TF_VAR_acm_certificate_arn" => nil,
-      "TF_VAR_api_hostname" => nil,
-      "TF_VAR_cloudflare_account_id" => nil,
-      "TF_VAR_cloudflare_r2_final_bucket_name" => nil,
-    },
-    "bash", "-eu", "-c", validation.fetch("run"),
-    chdir: root,
-  )
-  _, valid_error, valid_status = Open3.capture3(
-    {
-      "TF_VAR_acm_certificate_arn" => "arn:aws:acm:ap-northeast-2:123456789012:certificate/example",
-      "TF_VAR_api_hostname" => "api.staging.example.test",
-      "TF_VAR_cloudflare_account_id" => "00000000000000000000000000000000",
-      "TF_VAR_cloudflare_r2_final_bucket_name" => "dadamjang-staging-final",
-      "CLOUDFLARE_API_TOKEN" => "test-token",
-    },
-    "bash", "-eu", "-c", validation.fetch("run"),
-    chdir: root,
-  )
-  assert.call(!empty_status.success?, "Terraform input validation accepts blank protected variables")
-  assert.call(valid_status.success?, valid_error)
-
-  workflow_commands = terraform_job.fetch("steps").map { |step| step["run"] }.compact
-  assert.call(!workflow_commands.any? { |command| terraform_apply_command.call(command) }, "Terraform workflow can still apply an unreviewed plan")
-  workflow_definition = JSON.generate(terraform_apply)
-  assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
-  readme = File.read(File.join(root, "README.md"))
-  readme_bash = readme.scan(/```bash\n(.*?)\n```/m).flatten
-  assert.call(!readme_bash.any? { |commands| terraform_apply_command.call(commands) }, "README contains an executable Terraform apply command")
-  assert.call(!readme.include?("out-of-band 수동") && !readme.include?("수동 apply"), "README documents an unsupported manual apply procedure")
-  assert.call(readme.include?("Apply는 지원하지 않는다") && readme.include?("동일한 저장 plan") && readme.include?("staging-api-deploy"), "README omits the fail-closed future apply boundary")
 end
 
 check.call("staging ECS service waits for the HTTPS listener") do
@@ -1025,10 +925,6 @@ check.call("README documents the staging rollout contract") do
   assert.call(readme.include?("final_snapshot_identifier"), "README lacks the final snapshot identifier override")
   assert.call(readme.include?("aws rds delete-db-snapshot"), "README lacks snapshot collision cleanup guidance")
   assert.call(readme.include?("/health/ready"), "README lacks the readiness rollout prerequisite")
-  assert.call(readme.include?("CLOUDFLARE_R2_PENDING_BUCKET"), "README lacks the pending R2 runtime secret")
-  assert.call(readme.include?("Object Read & Write") && readme.include?("final+pending"), "README lacks the exact application R2 token scope")
-  assert.call(readme.include?("Workers R2 Storage Write"), "README lacks the Terraform R2 token boundary")
-  assert.call(readme.include?("public/custom domain"), "README lacks the pending bucket privacy contract")
 end
 
 exit(failures.empty? ? 0 : 1)

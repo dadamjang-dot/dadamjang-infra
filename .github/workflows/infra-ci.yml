@@ -59,6 +59,8 @@ jobs:
         run: terraform -chdir=terraform/staging test
       - name: Guard release contracts
         run: ruby tests/release-contracts.rb
+      - name: Guard Terraform plan contracts
+        run: ruby tests/terraform-plan-contracts.rb
       - name: Initialize e2e Terraform without a state backend
         run: terraform -chdir=terraform/e2e init -backend=false -input=false
       - name: Validate e2e Terraform

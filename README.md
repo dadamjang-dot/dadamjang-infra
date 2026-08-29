@@ -42,7 +42,7 @@ terraform fmt -recursive
 terraform validate
 ```
 
-로컬 plan은 GitHub `staging` Environment와 같은 보호 값을 환경 변수로 주입하고 원격 state를 선택한다.
+로컬 plan은 GitHub `staging` Environment와 같은 보호 값을 환경 변수로 주입하고 원격 state를 선택한다. `CLOUDFLARE_API_TOKEN`에는 짧은 수명의 `Workers R2 Storage Read` token만 사용한다.
 
 ```bash
 terraform login app.terraform.io
@@ -109,7 +109,7 @@ final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot
 | `CLOUDFLARE_R2_FINAL_BUCKET_NAME` | Variable | 승격 완료 이미지를 보관하는 기존 final bucket 이름 |
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
-| `CLOUDFLARE_TERRAFORM_API_TOKEN` | Secret | pending bucket 관리 전용 Cloudflare API token |
+| `CLOUDFLARE_TERRAFORM_PLAN_TOKEN` | Secret | `Workers R2 Storage Read`로 제한한 Cloudflare plan token |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
 | `HCP_TERRAFORM_PLAN_TOKEN` | Secret | staging state read/write와 lock/unlock으로 제한한 plan team API token |
 | `HCP_TERRAFORM_OUTPUT_TOKEN` | Secret | plan token과 구분한 staging output read-only team API token |
@@ -136,7 +136,7 @@ CLOUDFLARE_R2_FINAL_BUCKET_NAME=dadamjang-staging
 ```txt
 AWS_API_DEPLOY_ROLE_ARN
 AWS_TERRAFORM_ROLE_ARN
-CLOUDFLARE_TERRAFORM_API_TOKEN
+CLOUDFLARE_TERRAFORM_PLAN_TOKEN
 TF_BACKEND_CONFIG
 HCP_TERRAFORM_PLAN_TOKEN
 HCP_TERRAFORM_OUTPUT_TOKEN
@@ -195,7 +195,7 @@ aws secretsmanager put-secret-value \
 
 Terraform은 `${project_name}-${environment}-pending` R2 bucket을 final bucket과 구분해 만들고 모든 object에 86,400초(1일) 삭제 lifecycle을 적용한다. 이 pending bucket의 `r2.dev` managed domain은 비활성화하며 어떤 public/custom domain도 연결하지 않는다. `CLOUDFLARE_R2_PENDING_BUCKET` 값은 `pending_r2_bucket_name` output과 정확히 같아야 한다. 기존 final bucket은 이 root가 새로 소유하지 않는다.
 
-`CLOUDFLARE_TERRAFORM_API_TOKEN`은 pending bucket, lifecycle, managed-domain 상태를 관리하는 `Workers R2 Storage Write` 권한만 가진 짧은 수명의 별도 운영 token으로 둔다. 애플리케이션용 R2 S3 credential은 Object Read & Write 권한을 output `r2_application_bucket_names`의 exact final+pending 두 bucket에만 scope한다. 해당 access key, secret key, account endpoint는 GitHub secret이나 Terraform state가 아니라 위 AWS Secrets Manager JSON에만 저장하며, Terraform 관리 token과 재사용하지 않는다. Final bucket의 public delivery base URL과 Cloudflare Images transform base URL은 pending bucket에 적용하지 않는다.
+현재 plan workflow의 `CLOUDFLARE_TERRAFORM_PLAN_TOKEN`은 짧은 수명의 `Workers R2 Storage Read` 권한만 가지며 input validation과 Terraform plan step에만 노출한다. 향후 apply 경로는 별도 `CLOUDFLARE_TERRAFORM_APPLY_TOKEN`에 `Workers R2 Storage Write`를 부여하고 향후 exact apply step에만 노출해야 한다. Apply token은 plan token이나 애플리케이션용 R2 S3 credential로 재사용하지 않는다. 애플리케이션용 R2 S3 credential은 Object Read & Write 권한을 output `r2_application_bucket_names`의 exact final+pending 두 bucket에만 scope한다. 해당 access key, secret key, account endpoint는 GitHub secret이나 Terraform state가 아니라 위 AWS Secrets Manager JSON에만 저장하며, Terraform token과 재사용하지 않는다. Final bucket의 public delivery base URL과 Cloudflare Images transform base URL은 pending bucket에 적용하지 않는다.
 
 ## GitHub Actions
 
