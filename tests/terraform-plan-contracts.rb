@@ -109,12 +109,20 @@ check.call("Terraform workflow is plan-only with complete protected inputs") do
 
   workflow_commands = terraform_job.fetch("steps").map { |step| step["run"] }.compact
   assert.call(!workflow_commands.any? { |command| terraform_apply_command.call(command) }, "Terraform workflow can still apply an unreviewed plan")
+  artifact_uploads = terraform_job.fetch("steps").select do |step|
+    step["uses"].to_s.start_with?("actions/upload-artifact@")
+  end
+  assert.call(artifact_uploads.empty?, "Terraform plan job uploads an artifact")
+  tfplan_handoffs = (terraform_job.fetch("steps") - [plan]).select do |step|
+    JSON.generate(step).include?("staging.tfplan")
+  end
+  assert.call(tfplan_handoffs.empty?, "Terraform plan job hands staging.tfplan to another step")
   workflow_definition = JSON.generate(terraform_workflow)
   assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
   readme_bash = readme.scan(/```bash\n(.*?)\n```/m).flatten
   assert.call(!readme_bash.any? { |commands| terraform_apply_command.call(commands) }, "README contains an executable Terraform apply command")
   assert.call(!readme.include?("out-of-band 수동") && !readme.include?("수동 apply"), "README documents an unsupported manual apply procedure")
-  assert.call(readme.include?("Apply는 지원하지 않는다") && readme.include?("동일한 저장 plan") && readme.include?("staging-api-deploy"), "README omits the fail-closed future apply boundary")
+  assert.call(readme.include?("Apply는 지원하지 않는다") && readme.match?(/plan artifact는 .*의도적으로 업로드하지 않는다/) && readme.include?("immutable plan handoff") && readme.include?("staging-api-deploy"), "README omits the fail-closed future apply boundary")
   assert.call(plan.fetch("run") == "terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan", "Terraform plan step changed its reviewed command")
 end
 
