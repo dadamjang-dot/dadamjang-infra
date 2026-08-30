@@ -3,17 +3,29 @@ name: infra ci
 on:
   pull_request:
     paths:
+      - ".env.example"
+      - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "README.md"
+      - "docker/**"
       - "docker-compose.yml"
+      - "scripts/**"
       - "terraform/**"
+      - "tests/**"
   push:
     branches: [main]
     paths:
+      - ".env.example"
+      - ".github/workflows/api-deploy.yml"
       - ".github/workflows/infra-ci.yml"
       - ".github/workflows/terraform-apply.yml"
+      - "README.md"
+      - "docker/**"
       - "docker-compose.yml"
+      - "scripts/**"
       - "terraform/**"
+      - "tests/**"
 
 permissions:
   contents: read
@@ -22,8 +34,11 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.15.7
+          terraform_wrapper: false
       - name: Validate Docker Compose
         run: docker compose --env-file .env.example config --quiet
       - name: Check Terraform formatting
@@ -40,7 +55,15 @@ jobs:
         run: terraform -chdir=terraform/staging init -backend=false -input=false
       - name: Validate Terraform
         run: terraform -chdir=terraform/staging validate
+      - name: Test Terraform release contracts
+        run: terraform -chdir=terraform/staging test
+      - name: Guard release contracts
+        run: ruby tests/release-contracts.rb
+      - name: Guard Terraform plan contracts
+        run: ruby tests/terraform-plan-contracts.rb
       - name: Initialize e2e Terraform without a state backend
         run: terraform -chdir=terraform/e2e init -backend=false -input=false
       - name: Validate e2e Terraform
         run: terraform -chdir=terraform/e2e validate
+      - name: Test e2e Terraform release contracts
+        run: terraform -chdir=terraform/e2e test

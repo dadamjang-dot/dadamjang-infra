@@ -94,12 +94,13 @@ resource "aws_ecr_lifecycle_policy" "api" {
   policy = jsonencode({
     rules = [{
       action       = { type = "expire" }
-      description  = "Keep the 10 newest e2e API images."
+      description  = "Expire untagged API images after 7 days."
       rulePriority = 1
       selection = {
-        countNumber = 10
-        countType   = "imageCountMoreThan"
-        tagStatus   = "any"
+        countNumber = 7
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        tagStatus   = "untagged"
       }
     }]
   })
@@ -174,8 +175,8 @@ resource "aws_lb_target_group" "api" {
   health_check {
     healthy_threshold   = 2
     interval            = 30
-    matcher             = "200-499"
-    path                = "/graphql"
+    matcher             = "200"
+    path                = "/health/ready"
     timeout             = 5
     unhealthy_threshold = 3
   }
@@ -227,14 +228,17 @@ resource "aws_ecs_cluster" "main" {
 
 resource "aws_ecs_task_definition" "api" {
   container_definitions = jsonencode([{
-    command = ["node", "dist/main.js"]
     environment = [
       { name = "NODE_ENV", value = "e2e" },
       { name = "POSTGRES_DATABASE", value = local.database_name },
       { name = "POSTGRES_HOST", value = aws_db_instance.main.address },
       { name = "POSTGRES_PORT", value = "5432" },
+      { name = "POSTGRES_SSL", value = "true" },
+      { name = "POSTGRES_SSL_CA_PATH", value = "/etc/ssl/certs/aws-rds-global-bundle.pem" },
       { name = "POSTGRES_USERNAME", value = var.database_username },
       { name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379" },
+      { name = "SENTRY_ENVIRONMENT", value = "e2e" },
+      { name = "SENTRY_RELEASE", value = var.api_image_tag },
       { name = "TRUST_PROXY", value = "true" },
     ]
     essential = true
@@ -268,6 +272,11 @@ resource "aws_ecs_task_definition" "api" {
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   task_role_arn            = aws_iam_role.ecs_task.arn
+
+  runtime_platform {
+    cpu_architecture        = "X86_64"
+    operating_system_family = "LINUX"
+  }
 }
 
 resource "aws_ecs_service" "api" {

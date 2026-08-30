@@ -8,6 +8,16 @@ output "api_runtime_secret_arn" {
   value       = aws_secretsmanager_secret.api_runtime.arn
 }
 
+output "pending_r2_bucket_name" {
+  description = "Private one-day staging bucket required as CLOUDFLARE_R2_PENDING_BUCKET."
+  value       = cloudflare_r2_bucket.pending.name
+}
+
+output "r2_application_bucket_names" {
+  description = "Exact final and pending bucket scope for the application R2 S3 credential."
+  value       = sort(tolist(local.r2_application_bucket_names))
+}
+
 output "api_url" {
   description = "Public HTTPS endpoint for the staging API."
   value       = "https://${var.api_hostname}"
@@ -34,9 +44,29 @@ output "ecs_service_name" {
   value       = aws_ecs_service.api.name
 }
 
+output "ecs_task_definition_arn" {
+  description = "Terraform-reviewed ECS task definition ARN used to validate release configuration."
+  value       = aws_ecs_task_definition.api.arn
+}
+
 output "ecs_task_family" {
-  description = "ECS task definition family for API deployment workflows."
+  description = "ECS task definition family for staging API tasks."
   value       = aws_ecs_task_definition.api.family
+}
+
+output "ecs_release_contract" {
+  description = "Reviewed target and exact service revision observed by the latest Terraform apply."
+  value = {
+    canonical_task_definition_arn        = aws_ecs_task_definition.api.arn
+    image_repository                     = aws_ecr_repository.api.repository_url
+    observed_service_task_definition_arn = aws_ecs_service.api.task_definition
+    runtime_secret_names                 = sort(concat(["POSTGRES_PASSWORD"], tolist(local.runtime_secret_keys)))
+    source_hashes = {
+      for source in setunion(fileset(path.module, "*.tf"), toset([".terraform.lock.hcl"])) :
+      source => filesha256("${path.module}/${source}")
+    }
+    task_family = aws_ecs_task_definition.api.family
+  }
 }
 
 output "github_api_deploy_role_arn" {

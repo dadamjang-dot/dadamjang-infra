@@ -112,12 +112,13 @@ resource "aws_ecr_lifecycle_policy" "api" {
       action = {
         type = "expire"
       }
-      description  = "Keep the 20 newest API images."
+      description  = "Expire untagged API images after 7 days."
       rulePriority = 1
       selection = {
-        countNumber = 20
-        countType   = "imageCountMoreThan"
-        tagStatus   = "any"
+        countNumber = 7
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        tagStatus   = "untagged"
       }
     }]
   })
@@ -149,12 +150,13 @@ resource "aws_db_instance" "main" {
   deletion_protection         = var.enable_deletion_protection
   engine                      = "postgres"
   engine_version              = "16"
+  final_snapshot_identifier   = var.skip_final_snapshot ? null : coalesce(var.final_snapshot_identifier, "${local.name_prefix}-postgres-final")
   identifier                  = "${local.name_prefix}-postgres"
   instance_class              = var.database_instance_class
   manage_master_user_password = true
   multi_az                    = false
   publicly_accessible         = false
-  skip_final_snapshot         = !var.enable_deletion_protection
+  skip_final_snapshot         = var.skip_final_snapshot
   storage_encrypted           = true
   storage_type                = "gp3"
   username                    = var.database_username
@@ -194,8 +196,8 @@ resource "aws_lb_target_group" "api" {
   health_check {
     healthy_threshold   = 2
     interval            = 30
-    matcher             = "200-499"
-    path                = "/graphql"
+    matcher             = "200"
+    path                = "/health/ready"
     timeout             = 5
     unhealthy_threshold = 3
   }
@@ -259,8 +261,12 @@ resource "aws_ecs_task_definition" "api" {
         { name = "POSTGRES_DATABASE", value = var.database_name },
         { name = "POSTGRES_HOST", value = aws_db_instance.main.address },
         { name = "POSTGRES_PORT", value = "5432" },
+        { name = "POSTGRES_SSL", value = "true" },
+        { name = "POSTGRES_SSL_CA_PATH", value = "/etc/ssl/certs/aws-rds-global-bundle.pem" },
         { name = "POSTGRES_USERNAME", value = var.database_username },
         { name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379" },
+        { name = "SENTRY_ENVIRONMENT", value = "staging" },
+        { name = "SENTRY_RELEASE", value = var.api_image_tag },
         { name = "TRUST_PROXY", value = "true" },
       ]
       essential = true
@@ -297,6 +303,11 @@ resource "aws_ecs_task_definition" "api" {
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   task_role_arn            = aws_iam_role.ecs_task.arn
+
+  runtime_platform {
+    cpu_architecture        = "X86_64"
+    operating_system_family = "LINUX"
+  }
 }
 
 resource "aws_ecs_service" "api" {
@@ -331,10 +342,11 @@ resource "aws_ecs_service" "api" {
     ]
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.https]
 }
 
 resource "aws_cloudwatch_metric_alarm" "api_cpu" {
+  alarm_actions       = var.alarm_action_arns
   alarm_name          = "${local.name_prefix}-api-high-cpu"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 2
@@ -351,6 +363,7 @@ resource "aws_cloudwatch_metric_alarm" "api_cpu" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "api_memory" {
+  alarm_actions       = var.alarm_action_arns
   alarm_name          = "${local.name_prefix}-api-high-memory"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 2
@@ -363,5 +376,58 @@ resource "aws_cloudwatch_metric_alarm" "api_memory" {
   dimensions = {
     ClusterName = aws_ecs_cluster.main.name
     ServiceName = aws_ecs_service.api.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_alb_5xx" {
+  alarm_actions       = var.alarm_action_arns
+  alarm_name          = "${local.name_prefix}-api-alb-5xx"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "HTTPCode_ELB_5XX_Count"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = aws_lb.api.arn_suffix
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_unhealthy_hosts" {
+  alarm_actions       = var.alarm_action_arns
+  alarm_name          = "${local.name_prefix}-api-unhealthy-hosts"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "UnHealthyHostCount"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    LoadBalancer = aws_lb.api.arn_suffix
+    TargetGroup  = aws_lb_target_group.api.arn_suffix
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_zero_healthy_hosts" {
+  alarm_actions       = var.alarm_action_arns
+  alarm_name          = "${local.name_prefix}-api-zero-healthy-hosts"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HealthyHostCount"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60
+  statistic           = "Minimum"
+  threshold           = 1
+  treat_missing_data  = "breaching"
+
+  dimensions = {
+    LoadBalancer = aws_lb.api.arn_suffix
+    TargetGroup  = aws_lb_target_group.api.arn_suffix
   }
 }

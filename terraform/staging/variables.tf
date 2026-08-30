@@ -1,3 +1,9 @@
+variable "alarm_action_arns" {
+  description = "SNS topic ARNs notified by staging CloudWatch alarms."
+  type        = set(string)
+  default     = []
+}
+
 variable "alb_ingress_cidrs" {
   description = "CIDR blocks allowed to reach the public staging ALB."
   type        = set(string)
@@ -38,6 +44,26 @@ variable "aws_region" {
   default     = "ap-northeast-2"
 }
 
+variable "cloudflare_account_id" {
+  description = "Cloudflare account that owns the staging R2 buckets."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{32}$", var.cloudflare_account_id))
+    error_message = "cloudflare_account_id must be a lowercase 32-character Cloudflare account ID."
+  }
+}
+
+variable "cloudflare_r2_final_bucket_name" {
+  description = "Existing private/public-delivery staging R2 bucket containing promoted final images."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$", var.cloudflare_r2_final_bucket_name))
+    error_message = "cloudflare_r2_final_bucket_name must be a valid lowercase R2 bucket name."
+  }
+}
+
 variable "database_instance_class" {
   description = "RDS instance class for staging PostgreSQL."
   type        = string
@@ -57,9 +83,15 @@ variable "database_username" {
 }
 
 variable "enable_deletion_protection" {
-  description = "Enable deletion protection for stateful staging resources."
+  description = "Enable deletion protection for the staging RDS instance."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "final_snapshot_identifier" {
+  description = "Optional RDS final snapshot identifier used when final snapshots are enabled."
+  type        = string
+  default     = null
 }
 
 variable "github_repository" {
@@ -78,6 +110,12 @@ variable "project_name" {
   description = "Project name used in AWS resource names and tags."
   type        = string
   default     = "dadamjang"
+}
+
+variable "skip_final_snapshot" {
+  description = "Skip the staging RDS final snapshot during database deletion."
+  type        = bool
+  default     = false
 }
 
 variable "vpc_cidr" {

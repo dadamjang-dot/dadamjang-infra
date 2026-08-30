@@ -10,7 +10,12 @@ output "api_ecr_repository_url" {
 
 output "e2e_api_url" {
   description = "E2E_API_URL for the mobile workflow."
-  value       = "https://${var.api_hostname}"
+  value       = "https://${var.api_hostname}/graphql"
+}
+
+output "e2e_aws_region" {
+  description = "E2E_AWS_REGION for the protected mobile e2e workflow."
+  value       = var.aws_region
 }
 
 output "e2e_aws_role_arn" {
@@ -51,4 +56,14 @@ output "private_subnet_ids_csv" {
 output "api_security_group_id" {
   description = "Security group ID for the one-off e2e reset task."
   value       = aws_security_group.api.id
+}
+
+output "pending_r2_bucket_name" {
+  description = "Private one-day e2e bucket required as CLOUDFLARE_R2_PENDING_BUCKET."
+  value       = cloudflare_r2_bucket.pending.name
+}
+
+output "r2_application_bucket_names" {
+  description = "Exact final and pending bucket scope for the e2e application R2 S3 credential."
+  value       = sort(tolist(local.r2_application_bucket_names))
 }

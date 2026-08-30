@@ -4,7 +4,7 @@
 
 ## 구성
 
-- local: PostgreSQL 16, Redis 7, MinIO, Mailpit
+- local: PostgreSQL 16, Redis 7, Silo(MinIO 호환 S3), Mailpit
 - staging: AWS VPC, ALB, ECS Fargate API, RDS PostgreSQL, ElastiCache Redis, ECR, Secrets Manager, CloudWatch
 - e2e: staging과 분리된 AWS VPC, `dadamjang_e2e` RDS PostgreSQL, Redis, ECS Fargate API, ECR, Secrets Manager, HTTPS ALB
 - image: Cloudflare R2 원본 저장 + Cloudflare Images 변환. AWS S3와 CloudFront는 사용하지 않는다.
@@ -22,12 +22,14 @@ docker compose ps
 | --- | --- | --- |
 | PostgreSQL | `localhost:5432` | 애플리케이션 DB |
 | Redis | `localhost:6379` | 캐시·세션·큐 개발용 |
-| MinIO API | `http://localhost:9000` | S3 호환 로컬 이미지 저장소 |
-| MinIO Console | `http://localhost:9001` | MinIO 관리 UI |
+| Silo S3 API | `http://localhost:9000` | MinIO 호환 로컬 이미지 저장소 |
+| Silo Console | `http://localhost:9001` | 로컬 오브젝트 저장소 관리 UI |
 | Mailpit SMTP | `localhost:1025` | 로컬 메일 수신 |
 | Mailpit UI | `http://localhost:8025` | 수신 메일 확인 |
 
 종료는 `docker compose down`, 데이터까지 삭제하려면 `docker compose down -v`를 사용한다.
+
+루트 Compose는 README의 표준 로컬 부트스트랩이며 CI가 구성을 검증하므로 모든 서비스 이미지를 검토된 버전과 멀티 아키텍처 manifest digest로 고정한다. 기존 MinIO Community 컨테이너는 [유지보수가 종료](https://github.com/minio/minio#readme)되어 S3 API, `MINIO_*` 설정, 라우트, 디스크 형식을 유지하는 [Silo 2026-08-06](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-06T00-00-00Z)으로 교체했다. 기존 `minio-data`가 필요하면 최초 Silo 실행 전에 백업하고, 폐기 가능한 로컬 데이터라면 `docker compose down -v`로 새 볼륨에서 시작한다.
 
 BE 로컬 환경은 `POSTGRES_HOST=localhost`, `POSTGRES_PORT=5432`, `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=postgres`, `POSTGRES_DATABASE=dadamjang`을 사용한다. Mailpit은 `localhost:1025` SMTP로 연결한다.
 
@@ -38,15 +40,28 @@ cd terraform/staging
 terraform init -backend=false
 terraform fmt -recursive
 terraform validate
-terraform plan
 ```
 
-`terraform apply`는 실행하지 않는다. GitHub `staging` Environment 승인 후 `terraform-apply.yml`을 수동 실행한다.
+로컬 plan은 GitHub `staging` Environment와 같은 보호 값을 환경 변수로 주입하고 원격 state를 선택한다. `CLOUDFLARE_API_TOKEN`에는 짧은 수명의 `Workers R2 Storage Read` token만 사용한다.
 
-상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 또는 조직의 기존 원격 backend를 권장한다. `TF_BACKEND_CONFIG` GitHub Environment secret에 backend 설정을 HCL로 넣는다.
+```bash
+terraform login app.terraform.io
+export TF_VAR_acm_certificate_arn="arn:aws:acm:ap-northeast-2:123456789012:certificate/example"
+export TF_VAR_api_hostname="api.staging.example.com"
+export TF_VAR_cloudflare_account_id="00000000000000000000000000000000"
+export TF_VAR_cloudflare_r2_final_bucket_name="dadamjang-staging"
+export CLOUDFLARE_API_TOKEN="replace-with-a-short-lived-token"
+terraform init -reconfigure -backend-config=backend.hcl
+terraform plan -input=false
+```
+
+CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. 현재 Apply는 지원하지 않는다. 보호 승인 뒤 정확히 동일한 저장 plan을 소비하고 API deploy와 같은 `staging-api-deploy` concurrency group을 공유하는 apply job이 구현될 때까지 apply는 unavailable이며, 로컬이나 외부 절차로 우회해서는 안 된다.
+
+상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 원격 backend를 사용한다. `TF_BACKEND_CONFIG` GitHub Environment secret에는 비자격증명 backend 설정만 HCL로 넣고, plan과 API output 조회는 서로 다른 HCP Terraform Environment secret으로 인증한다.
 
 ```hcl
 # 예: HCP Terraform remote backend 설정
+hostname     = "app.terraform.io"
 organization = "your-terraform-cloud-organization"
 
 workspaces {
@@ -54,16 +69,32 @@ workspaces {
 }
 ```
 
-현재 root module은 backend block을 고정하지 않는다. CI가 위 설정을 `backend.hcl`로 전달한다. 로컬에서 원격 state를 쓸 때도 같은 backend 설정 파일을 사용한다.
+staging과 e2e root module은 빈 `remote` backend block을 선언한다. 각 HCP Terraform workspace는 사용 전에 **Execution Mode = Local**로 설정한다. `TF_BACKEND_CONFIG`와 로컬 `backend.hcl`에는 `hostname`, `organization`, `workspaces`만 넣으며 실행 모드는 HCP workspace 설정에서 관리한다. `terraform-apply.yml`은 staging workspace의 local plan에 필요한 state read/write와 lock/unlock으로 제한한 team API token을 `HCP_TERRAFORM_PLAN_TOKEN`으로 사용한다. `api-deploy.yml`은 별도의 output read-only team API token을 `HCP_TERRAFORM_OUTPUT_TOKEN`으로 사용하며 두 secret에 같은 token을 등록하지 않는다. Organization API token과 agent token은 CI 인증에 사용하지 않는다. 두 team token에는 가능한 가장 짧은 만료 시간을 설정한다. 인프라 운영 담당자는 plan token을, API 배포 운영 담당자는 output token을 소유하고 만료 전에 독립적으로 rotation한다. 로컬의 `terraform login app.terraform.io`는 개발자 개인의 user API token을 별도로 구성한다. Token은 `hashicorp/setup-terraform`의 `cli_config_credentials_token` 입력으로만 전달하며 `TF_BACKEND_CONFIG`, `backend.hcl`, Terraform plan, 업로드 artifact, shell command, log에 넣지 않는다. CI와 로컬 plan은 이 partial 설정으로 원격 state를 선택하고 GitHub runner 또는 로컬 Terraform에서 실행한다. `terraform init -backend=false`는 fmt/validate/test 같은 state 불필요 검사에만 사용한다.
 
-첫 Terraform apply는 ECS service를 `desired_count = 0`으로 만든다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
+향후 보호된 apply job의 첫 실행은 ECS service를 `desired_count = 0`으로 만들어야 한다. 아직 ECR 이미지가 없어서다. 이후 `api-deploy.yml`이 첫 이미지를 push하고 service를 1개 task로 시작한다. Terraform은 CI가 관리하는 task definition과 desired count를 덮어쓰지 않는다.
 
-ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `200-499`를 정상으로 취급한다. BE에 전용 `200` health endpoint가 생기면 matcher를 `200`으로 좁혀야 한다.
+ALB health check는 인증 없이 정확히 `200`을 반환하는 backend readiness endpoint `/health/ready`를 사용한다. rollout 전에 배포 대상 backend commit이 이 endpoint를 제공하는지 확인한다.
+
+ECS task는 RDS 연결에 `POSTGRES_SSL=true`와 `POSTGRES_SSL_CA_PATH=/etc/ssl/certs/aws-rds-global-bundle.pem`을 사용한다. backend image build는 AWS RDS global bundle을 고정 SHA-256으로 검증해 해당 경로에 넣는다. 현재 공식 URL은 `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`, 새로 검증한 SHA-256은 `e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3`이다. Download에는 Node 내장 `fetch`를 사용하며 build 중 mutable Alpine package를 설치하지 않는다.
+
+상류 AWS bundle이 교체되면 digest도 바뀌므로 image build는 의도적으로 즉시 실패(fail closed)한다. Pin을 안전하게 갱신하려면 위 공식 URL에서만 bundle을 내려받고, `sha256sum`으로 새 SHA-256을 독립적으로 계산한 뒤 AWS가 공개한 인증서 출처 및 인증서 내용과 대조한다. Bundle과 digest 변경을 검토한 후에만 `docker/backend.Dockerfile`의 pin을 갱신한다.
+
+### staging RDS safe destroy
+
+staging RDS는 기본적으로 `enable_deletion_protection=true`, `skip_final_snapshot=false`다. 보호된 same-plan apply job이 제공된 이후 삭제가 필요하면 먼저 deletion protection만 `false`로 반영하고, final snapshot을 남긴 채 destroy한다. `final_snapshot_identifier`를 지정하지 않으면 `dadamjang-staging-postgres-final`을 사용한다.
+
+같은 identifier의 snapshot이 이미 있으면 destroy가 실패한다. 보관할 snapshot에는 고유한 `final_snapshot_identifier` override를 지정한다. 기존 snapshot이 불필요함을 확인한 경우에만 다음 명령으로 수동 삭제한 뒤 다시 destroy한다.
+
+```bash
+aws rds delete-db-snapshot --db-snapshot-identifier dadamjang-staging-postgres-final
+```
+
+final snapshot을 명시적으로 포기하는 경우에만 `skip_final_snapshot=true`를 사용한다. e2e RDS는 테스트용 disposable 환경이라 deletion protection 없이 final snapshot을 건너뛴다.
 
 ## AWS 사전 준비
 
 1. AWS 계정에서 GitHub Actions OIDC provider `https://token.actions.githubusercontent.com`를 1회 생성한다. Terraform의 `data.aws_iam_openid_connect_provider.github_actions`가 이를 참조한다.
-2. AWS 자격 증명으로 Terraform을 1회 apply한다. 계정 ID는 코드에 넣지 않는다.
+2. 보호된 same-plan apply job이 제공된 이후에만 초기 Terraform provisioning을 진행한다. 현재 저장소에는 실행 가능한 초기 apply 경로가 없다. 계정 ID는 코드에 넣지 않는다.
 3. output에서 아래 값을 GitHub `dadamjang-dot/dadamjang-infra`의 `staging` Environment에 등록한다.
 
 | 이름 | 종류 | 값 |
@@ -72,12 +103,20 @@ ALB health check는 backend의 현재 GraphQL endpoint(`/graphql`)에 맞춰 `20
 | `AWS_ECR_REPOSITORY` | Variable | `api_ecr_repository_url`의 repository 이름 부분 |
 | `AWS_ECS_CLUSTER` | Variable | `ecs_cluster_name` |
 | `AWS_ECS_SERVICE` | Variable | `ecs_service_name` |
-| `AWS_ECS_TASK_FAMILY` | Variable | `ecs_task_family` |
+| `ACM_CERTIFICATE_ARN` | Variable | staging HTTPS listener 인증서 ARN |
+| `API_HOSTNAME` | Variable | staging API DNS hostname |
+| `CLOUDFLARE_ACCOUNT_ID` | Variable | staging R2 bucket을 소유한 Cloudflare account ID |
+| `CLOUDFLARE_R2_FINAL_BUCKET_NAME` | Variable | 승격 완료 이미지를 보관하는 기존 final bucket 이름 |
 | `AWS_API_DEPLOY_ROLE_ARN` | Secret | `github_api_deploy_role_arn` |
 | `AWS_TERRAFORM_ROLE_ARN` | Secret | staging Terraform 권한을 가진 별도 OIDC role ARN |
+| `CLOUDFLARE_TERRAFORM_PLAN_TOKEN` | Secret | `Workers R2 Storage Read`로 제한한 Cloudflare plan token |
 | `TF_BACKEND_CONFIG` | Secret | 원격 Terraform state backend HCL |
+| `HCP_TERRAFORM_PLAN_TOKEN` | Secret | staging state read/write와 lock/unlock으로 제한한 plan team API token |
+| `HCP_TERRAFORM_OUTPUT_TOKEN` | Secret | plan token과 구분한 staging output read-only team API token |
 
-API deploy role은 ECR push와 ECS task definition/service 갱신만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. Terraform apply workflow은 `staging` Environment 보호 규칙(Required reviewers)을 반드시 설정한 뒤 사용한다.
+API deploy role은 ECR image 확인/업로드, ECS task definition 등록, migration task 실행, service 갱신에 필요한 권한만 허용한다. Terraform role은 별도로 만들고 AWS resource provisioning에 필요한 최소 권한만 부여한다. `staging` Environment는 배포 branch를 `main`으로만 제한하고 Required reviewers와 Prevent self-review를 설정해 배포자가 자신의 배포를 승인할 수 없게 한다. Terraform plan과 API deploy는 이 보호 규칙을 설정한 뒤 사용한다.
+
+CloudWatch alarm 알림을 사용하려면 먼저 SNS topic과 subscription을 별도로 만들고 SNS topic ARN을 Terraform의 `alarm_action_arns`에 전달한다. 기본값은 빈 set이며 이 root는 SNS resource를 만들지 않는다.
 
 현재 `staging` Environment variables는 아래 기본 naming으로 등록되어 있다.
 
@@ -86,7 +125,10 @@ AWS_REGION=ap-northeast-2
 AWS_ECR_REPOSITORY=dadamjang-staging-api
 AWS_ECS_CLUSTER=dadamjang-staging-cluster
 AWS_ECS_SERVICE=dadamjang-staging-api
-AWS_ECS_TASK_FAMILY=dadamjang-staging-api
+ACM_CERTIFICATE_ARN=arn:aws:acm:ap-northeast-2:123456789012:certificate/example
+API_HOSTNAME=api.staging.example.com
+CLOUDFLARE_ACCOUNT_ID=00000000000000000000000000000000
+CLOUDFLARE_R2_FINAL_BUCKET_NAME=dadamjang-staging
 ```
 
 아래 secrets는 실제 AWS 계정과 원격 Terraform backend 값이 있어야 등록할 수 있다.
@@ -94,7 +136,10 @@ AWS_ECS_TASK_FAMILY=dadamjang-staging-api
 ```txt
 AWS_API_DEPLOY_ROLE_ARN
 AWS_TERRAFORM_ROLE_ARN
+CLOUDFLARE_TERRAFORM_PLAN_TOKEN
 TF_BACKEND_CONFIG
+HCP_TERRAFORM_PLAN_TOKEN
+HCP_TERRAFORM_OUTPUT_TOKEN
 ```
 
 ## API runtime secrets
@@ -103,19 +148,42 @@ Terraform은 Secrets Manager secret 컨테이너만 만든다. 비밀값은 Terr
 
 ```json
 {
+  "API_PUBLIC_BASE_URL": "https://api.staging.example.com",
+  "CLIENT_URL": "https://staging.example.com",
+  "DADAMJANG_BO_URL": "https://bo.staging.example.com",
+  "IDENTITY_CI_PEPPER": "replace-me",
+  "IDENTITY_INICIS_API_KEY": "replace-me",
+  "IDENTITY_INICIS_CALLBACK_BASE_URL": "https://api.staging.example.com",
+  "IDENTITY_INICIS_MID": "replace-me",
+  "IDENTITY_INICIS_SEED_IV": "replace-me",
+  "JWT_ACCESS_TOKEN_EXP": "15m",
   "JWT_ACCESS_TOKEN_SECRET": "replace-me",
+  "JWT_REFRESH_TOKEN_EXP": "7d",
   "JWT_REFRESH_TOKEN_SECRET": "replace-me",
   "EMAIL_CODE_PEPPER": "replace-me",
   "KAKAO_CLIENT_ID": "replace-me",
+  "KAKAO_CALLBACK_URL": "https://api.staging.example.com/api/auth/kakao/callback",
   "RESEND_API_KEY": "replace-me",
+  "RESEND_FROM_EMAIL": "no-reply@example.com",
   "CLOUDFLARE_R2_ENDPOINT": "https://<account-id>.r2.cloudflarestorage.com",
   "CLOUDFLARE_R2_ACCESS_KEY_ID": "replace-me",
   "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "replace-me",
   "CLOUDFLARE_R2_BUCKET": "dadamjang-staging",
+  "CLOUDFLARE_R2_PENDING_BUCKET": "dadamjang-staging-pending",
   "CLOUDFLARE_R2_PUBLIC_BASE_URL": "https://images.example.com",
-  "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://imagedelivery.net/<account-hash>"
+  "CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL": "https://images.example.com/cdn-cgi/image",
+  "SENTRY_DSN": "https://<public-key>@<sentry-host>/<project-id>"
 }
 ```
+
+새 task definition을 등록하기 전에 위 JSON의 모든 key를 실제 값으로 새 secret version에 등록해야 한다. Terraform은 JSON 값이 아니라 key별 ECS 참조만 추가하므로, 누락된 key가 있으면 새 task가 시작되지 않는다. OIDC trust 변경은 보호된 apply job이 제공되기 전에는 반영할 수 없으며, 반영 전 API deploy를 실행하지 않는다.
+
+rollout 전에는 다음 조건을 모두 충족한다.
+
+- 배포 대상 backend가 `/health/ready`에서 인증 없이 `200`을 반환한다.
+- staging과 e2e Secrets Manager JSON에 `SENTRY_DSN`을 포함한 `local.runtime_secret_keys`의 exact key set과 실제 값을 등록한다.
+- 새 task environment, secret reference, alarm 설정은 보호된 apply job으로 반영한 뒤 immutable image deploy를 실행한다.
+- alarm 알림을 켤 경우 `alarm_action_arns`가 가리키는 SNS topic ARN과 subscription을 미리 만든다.
 
 예시 JSON을 실제 값으로 저장한 뒤 다음처럼 등록한다.
 
@@ -125,15 +193,27 @@ aws secretsmanager put-secret-value \
   --secret-string file://runtime-secrets.json
 ```
 
-Cloudflare에서는 R2 bucket, S3 API token(해당 bucket read/write만), public delivery base URL, Cloudflare Images transform base URL을 만든다. Cloudflare access key, secret key, account endpoint는 GitHub secret이 아니라 위 AWS Secrets Manager JSON에만 저장한다.
+Terraform은 `${project_name}-${environment}-pending` R2 bucket을 final bucket과 구분해 만들고 모든 object에 86,400초(1일) 삭제 lifecycle을 적용한다. 이 pending bucket의 `r2.dev` managed domain은 비활성화하며 어떤 public/custom domain도 연결하지 않는다. `CLOUDFLARE_R2_PENDING_BUCKET` 값은 `pending_r2_bucket_name` output과 정확히 같아야 한다. 기존 final bucket은 이 root가 새로 소유하지 않는다.
+
+현재 plan workflow의 `CLOUDFLARE_TERRAFORM_PLAN_TOKEN`은 짧은 수명의 `Workers R2 Storage Read` 권한만 가지며 input validation과 Terraform plan step에만 노출한다. 향후 apply 경로는 별도 `CLOUDFLARE_TERRAFORM_APPLY_TOKEN`에 `Workers R2 Storage Write`를 부여하고 향후 exact apply step에만 노출해야 한다. Apply token은 plan token이나 애플리케이션용 R2 S3 credential로 재사용하지 않는다. 애플리케이션용 R2 S3 credential은 Object Read & Write 권한을 output `r2_application_bucket_names`의 exact final+pending 두 bucket에만 scope한다. 해당 access key, secret key, account endpoint는 GitHub secret이나 Terraform state가 아니라 위 AWS Secrets Manager JSON에만 저장하며, Terraform token과 재사용하지 않는다. Final bucket의 public delivery base URL과 Cloudflare Images transform base URL은 pending bucket에 적용하지 않는다.
 
 ## GitHub Actions
 
 - `infra-ci.yml`: infra PR/main 변경 시 Compose config, Terraform fmt, Terraform validate를 수행한다. state backend 없이 validate한다.
-- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 plan 또는 apply한다.
+- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 보호된 입력과 원격 state로 plan만 실행한다.
 - `api-deploy.yml`: `repository_dispatch` 타입 `backend-main` 또는 수동 실행으로 BE를 lint/test/build하고 ECR push, ECS deploy를 수행한다. deploy job은 `staging` Environment 승인을 요구한다.
 
+API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다. Node base는 공식 `linux/amd64` manifest digest로 고정하고 build와 Fargate runtime도 각각 `linux/amd64`, `X86_64`로 고정한다. Push 또는 tag 재사용 후 ECR에서 digest를 다시 조회해 `repository@sha256:...`만 task definition에 등록한다.
+
+배포는 ECR digest를 확정한 뒤 해당 image 안의 `/app/retired-migrations/0005_catalog_demo_products.sql`을 실행 환경에서 직접 읽어 historical SHA-256 `44d98c294ac8c2afa502f7bdb2c65411df7d4879dad39cd5b4fbc8cf9c94059f`와 일치하는지 확인한다. 검증되지 않은 digest는 task definition에 전달하지 않는다.
+
+`ecs_release_contract`는 Terraform이 만든 canonical task definition, apply 시점에 refresh한 ECS service의 exact task-definition revision, ECR repository, runtime secret 이름, task-contract source hash를 하나로 묶는다. API deploy는 live service의 exact revision을 읽고 canonical contract를 엄격히 검증한 다음 canonical definition에서 새 digest와 `SENTRY_RELEASE`만 바꿔 등록한다. Live contract가 canonical과 이미 같으면 일반 image-only deploy로 진행한다. Contract가 다르면 live revision이 Terraform apply가 관측한 revision과 정확히 같을 때만 한 번의 contract transition을 허용한다. 따라서 service drift나 다른 infra commit의 stale state는 자동 승인되지 않는다.
+
+기존 staging output 또는 새 runtime contract의 Terraform 변경은 현재 적용할 수 없다. 로컬이나 외부 실행으로 우회하지 않는다. 향후 apply job은 `staging` Environment 승인 아래 검토된 정확히 동일한 저장 plan만 소비하고 API deploy의 `staging-api-deploy` concurrency group을 공유해 canonical-contract 관측부터 service 갱신까지의 경계와 직렬화되어야 한다. 이 경로가 구현되고 성공한 뒤에만 같은 infra commit의 API deploy를 허용한다. Live revision이 예상과 다르면 drift를 조사·복구하고 새 plan부터 다시 검토하며 state만 다시 승인해서는 안 된다.
+
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
+
+`repository_dispatch`의 `client_payload.ref`는 누락이나 mutable fallback 없이 정확한 소문자 40자리 commit SHA여야 한다. 수동 `workflow_dispatch`는 별도의 필수 `backend_ref` 문자열을 사용하며 기본값은 `main`이다.
 
 ```yaml
 # dadamjang-be/.github/workflows/deploy-dispatch.yml에 추가할 계약
