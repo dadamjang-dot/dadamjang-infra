@@ -55,7 +55,7 @@ terraform init -reconfigure -backend-config=backend.hcl
 terraform plan -input=false
 ```
 
-CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. 현재 Apply는 지원하지 않는다. 보호 승인 뒤 정확히 동일한 저장 plan을 소비하고 API deploy와 같은 `staging-api-deploy` concurrency group을 공유하는 apply job이 구현될 때까지 apply는 unavailable이며, 로컬이나 외부 절차로 우회해서는 안 된다.
+CI의 `terraform-apply.yml`은 이름을 유지하지만 plan만 실행하며 `terraform apply`를 실행하지 않는다. 현재 Apply는 지원하지 않는다. `staging.tfplan`은 runner 안에서만 생성되고 plan artifact는 backend data를 포함할 수 있어 의도적으로 업로드하지 않는다. 보호 승인 뒤 정확히 동일한 저장 plan을 소비하고 API deploy와 같은 `staging-api-deploy` concurrency group을 공유하는 apply job이 구현될 때까지 apply는 unavailable이며, 로컬이나 외부 절차로 우회해서는 안 된다.
 
 상태 파일은 Git에 저장하지 않는다. AWS S3를 사용하지 않기 위해 HCP Terraform 원격 backend를 사용한다. `TF_BACKEND_CONFIG` GitHub Environment secret에는 비자격증명 backend 설정만 HCL로 넣고, plan과 API output 조회는 서로 다른 HCP Terraform Environment secret으로 인증한다.
 
@@ -200,7 +200,7 @@ Terraform은 `${project_name}-${environment}-pending` R2 bucket을 final bucket�
 ## GitHub Actions
 
 - `infra-ci.yml`: infra PR/main 변경 시 Compose config, Terraform fmt, Terraform validate를 수행한다. state backend 없이 validate한다.
-- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 보호된 입력과 원격 state로 plan만 실행한다.
+- `terraform-apply.yml`: 수동 실행만 가능하다. `staging` Environment 승인 후 보호된 입력과 원격 state로 plan만 실행한다. plan artifact는 저장하지 않으며 apply job은 없다.
 - `api-deploy.yml`: `repository_dispatch` 타입 `backend-main` 또는 수동 실행으로 BE를 lint/test/build하고 ECR push, ECS deploy를 수행한다. deploy job은 `staging` Environment 승인을 요구한다.
 
 API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Image tag `backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>`는 테스트한 backend source와 infra가 소유한 Docker build definition을 함께 식별하며, 같은 tag가 ECR에 있으면 기존 immutable image를 재사용한다. Node base는 공식 `linux/amd64` manifest digest로 고정하고 build와 Fargate runtime도 각각 `linux/amd64`, `X86_64`로 고정한다. Push 또는 tag 재사용 후 ECR에서 digest를 다시 조회해 `repository@sha256:...`만 task definition에 등록한다.
@@ -209,7 +209,7 @@ API deploy는 test job이 확정한 backend commit만 다시 checkout한다. Ima
 
 `ecs_release_contract`는 Terraform이 만든 canonical task definition, apply 시점에 refresh한 ECS service의 exact task-definition revision, ECR repository, runtime secret 이름, task-contract source hash를 하나로 묶는다. API deploy는 live service의 exact revision을 읽고 canonical contract를 엄격히 검증한 다음 canonical definition에서 새 digest와 `SENTRY_RELEASE`만 바꿔 등록한다. Live contract가 canonical과 이미 같으면 일반 image-only deploy로 진행한다. Contract가 다르면 live revision이 Terraform apply가 관측한 revision과 정확히 같을 때만 한 번의 contract transition을 허용한다. 따라서 service drift나 다른 infra commit의 stale state는 자동 승인되지 않는다.
 
-기존 staging output 또는 새 runtime contract의 Terraform 변경은 현재 적용할 수 없다. 로컬이나 외부 실행으로 우회하지 않는다. 향후 apply job은 `staging` Environment 승인 아래 검토된 정확히 동일한 저장 plan만 소비하고 API deploy의 `staging-api-deploy` concurrency group을 공유해 canonical-contract 관측부터 service 갱신까지의 경계와 직렬화되어야 한다. 이 경로가 구현되고 성공한 뒤에만 같은 infra commit의 API deploy를 허용한다. Live revision이 예상과 다르면 drift를 조사·복구하고 새 plan부터 다시 검토하며 state만 다시 승인해서는 안 된다.
+기존 staging output 또는 새 runtime contract의 Terraform 변경은 현재 적용할 수 없다. 로컬이나 외부 실행으로 우회하지 않는다. apply를 안전하게 만들려면 Terraform state와 provider credentials를 노출하지 않는 immutable plan handoff, artifact 무결성 검증, apply 전 `staging` Environment 보호 승인, `CLOUDFLARE_TERRAFORM_APPLY_TOKEN`의 exact apply-step 격리, 그리고 `staging-api-deploy` concurrency 직렬화가 검토·승인되어야 한다. 이 경로가 구현되고 성공한 뒤에만 같은 infra commit의 API deploy를 허용한다. Live revision이 예상과 다르면 drift를 조사·복구하고 새 plan부터 다시 검토하며 state만 다시 승인해서는 안 된다.
 
 `dadamjang-be`의 main merge가 deploy를 자동 시작하려면 BE workflow가 infra repository에 dispatch를 보내야 한다. infra workflow만으로는 다른 repository의 main push를 구독할 수 없다.
 

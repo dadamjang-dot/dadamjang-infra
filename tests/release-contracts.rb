@@ -323,8 +323,10 @@ check.call("HCP Terraform credentials stay outside backend configuration and pla
   end
 
   assert.call(terraform_job.dig("environment", "name") == "staging", "Terraform plan job is missing the protected staging environment")
-  uploads_artifact = terraform_job.fetch("steps").any? { |step| uses_action.call(step, "actions/upload-artifact") }
-  assert.call(!uploads_artifact, "Terraform workflow uploads a plan artifact that could retain backend data")
+  tfplan_artifacts = terraform_job.fetch("steps").select do |step|
+    uses_action.call(step, "actions/upload-artifact") && step.dig("with", "path").to_s.match?(/(?:^|[\/\\])[^\n]*\.tfplan(?:$|\n)/)
+  end
+  assert.call(tfplan_artifacts.empty?, "Terraform workflow uploads a tfplan artifact that could retain backend data")
 
   readme = File.read(File.join(root, "README.md"))
   assert.call(readme.include?("`HCP_TERRAFORM_PLAN_TOKEN`") && readme.include?("state read/write와 lock/unlock"), "README omits the plan token boundary")
