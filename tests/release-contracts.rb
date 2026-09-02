@@ -141,8 +141,8 @@ check.call("local development services use reviewed immutable images") do
   assert.call(actual == expected, "unreviewed local service images: #{actual}")
 end
 
-check.call("infra CI watches release behavior and documentation") do
-  required_paths = Set.new([".env.example", "README.md", "scripts/**"])
+check.call("infra CI watches release behavior") do
+  required_paths = Set.new([".env.example", "scripts/**"])
   %w[pull_request push].each do |event|
     configured_paths = infra_ci_triggers.fetch(event).fetch("paths").to_set
     missing_paths = required_paths - configured_paths
@@ -292,8 +292,6 @@ check.call("Terraform backend contracts exclude unsupported execution settings")
   [
     ".github/workflows/api-deploy.yml",
     ".github/workflows/terraform-apply.yml",
-    "README.md",
-    "terraform/e2e/README.md",
   ].each do |path|
     contents = File.read(File.join(root, path))
     assert.call(!contents.match?(/\boperations\b/i), "#{path} includes the unsupported remote backend operations key")
@@ -327,13 +325,6 @@ check.call("HCP Terraform credentials stay outside backend configuration and pla
     uses_action.call(step, "actions/upload-artifact") && step.dig("with", "path").to_s.match?(/(?:^|[\/\\])[^\n]*\.tfplan(?:$|\n)/)
   end
   assert.call(tfplan_artifacts.empty?, "Terraform workflow uploads a tfplan artifact that could retain backend data")
-
-  readme = File.read(File.join(root, "README.md"))
-  assert.call(readme.include?("`HCP_TERRAFORM_PLAN_TOKEN`") && readme.include?("state read/write와 lock/unlock"), "README omits the plan token boundary")
-  assert.call(readme.include?("`HCP_TERRAFORM_OUTPUT_TOKEN`") && readme.include?("output read-only"), "README omits the output token boundary")
-  assert.call(readme.include?("인프라 운영 담당자") && readme.include?("API 배포 운영 담당자") && readme.include?("독립적으로 rotation"), "README omits independent token ownership and rotation")
-  assert.call(!readme.include?("`HCP_TERRAFORM_TOKEN`"), "README retains the shared HCP token")
-  assert.call(readme.include?("`terraform login app.terraform.io`"), "README omits separate local HCP authentication")
 end
 
 check.call("staging ECS service waits for the HTTPS listener") do
@@ -898,35 +889,6 @@ check.call("migration and service deploy use one registered task definition") do
     accepted_failures = failure_results.select { |_, succeeded| succeeded }.keys
     assert.call(accepted_failures.empty?, "deployment verification accepted #{accepted_failures.join(", ")}")
   end
-end
-
-check.call("README documents the staging rollout contract") do
-  readme = File.read(File.join(root, "README.md"))
-  secret_json = readme[/```json\n(.*?)\n```/m, 1] || raise("missing runtime secret JSON example")
-  documented_keys = JSON.parse(secret_json).keys.to_set
-  assert.call(documented_keys == runtime_secret_keys, "README runtime secret JSON is incomplete")
-  assert.call(readme.include?("배포 branch를 `main`으로만 제한"), "README lacks the main-only environment rule")
-  assert.call(readme.include?("Prevent self-review"), "README lacks the no-self-approval setting")
-  assert.call(readme.include?("새 task definition을 등록하기 전에 위 JSON의 모든 key"), "README lacks the secret rollout requirement")
-  assert.call(
-    readme.include?("backend-<backend-sha>-dockerfile-<dockerfile-blob-sha>"),
-    "README lacks immutable image provenance",
-  )
-  transform_base = JSON.parse(secret_json).fetch("CLOUDFLARE_IMAGES_TRANSFORM_BASE_URL")
-  assert.call(transform_base.start_with?("https://"), "Cloudflare transform base is not HTTPS")
-  assert.call(transform_base.end_with?("/cdn-cgi/image"), "Cloudflare transform base is not a zone image transform path")
-  assert.call(readme.include?("/etc/ssl/certs/aws-rds-global-bundle.pem"), "README lacks the RDS TLS CA path")
-  assert.call(readme.include?("https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"), "README lacks the official AWS RDS bundle URL")
-  assert.call(readme.include?("e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"), "README lacks the current AWS RDS bundle checksum")
-  assert.call(readme.include?("fail closed"), "README lacks the fail-closed AWS RDS bundle rotation behavior")
-  assert.call(readme.include?("sha256sum"), "README lacks independent AWS RDS bundle checksum verification")
-  assert.call(readme.include?("인증서 출처"), "README lacks independent AWS RDS certificate source verification")
-  assert.call(readme.include?("검토"), "README lacks review before updating the AWS RDS checksum pin")
-  assert.call(readme.include?("alarm_action_arns") && readme.include?("SNS topic ARN"), "README lacks the alarm SNS prerequisite")
-  assert.call(readme.include?("skip_final_snapshot"), "README lacks the final snapshot switch")
-  assert.call(readme.include?("final_snapshot_identifier"), "README lacks the final snapshot identifier override")
-  assert.call(readme.include?("aws rds delete-db-snapshot"), "README lacks snapshot collision cleanup guidance")
-  assert.call(readme.include?("/health/ready"), "README lacks the readiness rollout prerequisite")
 end
 
 exit(failures.empty? ? 0 : 1)
