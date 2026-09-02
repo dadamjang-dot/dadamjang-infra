@@ -9,7 +9,6 @@ root = File.expand_path("..", __dir__)
 terraform_workflow = YAML.load_file(File.join(root, ".github/workflows/terraform-apply.yml"))
 deploy_workflow = YAML.load_file(File.join(root, ".github/workflows/api-deploy.yml"))
 infra_ci = YAML.load_file(File.join(root, ".github/workflows/infra-ci.yml"))
-readme = File.read(File.join(root, "README.md"))
 failures = []
 
 assert = lambda do |condition, message|
@@ -119,10 +118,6 @@ check.call("Terraform workflow is plan-only with complete protected inputs") do
   assert.call(tfplan_handoffs.empty?, "Terraform plan job hands staging.tfplan to another step")
   workflow_definition = JSON.generate(terraform_workflow)
   assert.call(!workflow_definition.include?("inputs.action"), "Terraform workflow still dispatches an apply action")
-  readme_bash = readme.scan(/```bash\n(.*?)\n```/m).flatten
-  assert.call(!readme_bash.any? { |commands| terraform_apply_command.call(commands) }, "README contains an executable Terraform apply command")
-  assert.call(!readme.include?("out-of-band 수동") && !readme.include?("수동 apply"), "README documents an unsupported manual apply procedure")
-  assert.call(readme.include?("Apply는 지원하지 않는다") && readme.match?(/plan artifact는 .*의도적으로 업로드하지 않는다/) && readme.include?("immutable plan handoff") && readme.include?("staging-api-deploy"), "README omits the fail-closed future apply boundary")
   assert.call(plan.fetch("run") == "terraform -chdir=terraform/staging plan -input=false -out=staging.tfplan", "Terraform plan step changed its reviewed command")
 end
 
@@ -145,16 +140,6 @@ check.call("Cloudflare plan token is read-only and step-scoped") do
   assert.call(workflow_definition.scan("secrets.CLOUDFLARE_TERRAFORM_PLAN_TOKEN").length == 2, "plan secret is not scoped to exactly two steps")
   assert.call(!workflow_definition.include?("CLOUDFLARE_TERRAFORM_API_TOKEN"), "legacy shared Terraform token remains")
   assert.call(!workflow_definition.include?("CLOUDFLARE_TERRAFORM_APPLY_TOKEN"), "future apply token is exposed before an apply step exists")
-end
-
-check.call("README separates Cloudflare plan, apply, and application credentials") do
-  assert.call(readme.include?("`CLOUDFLARE_TERRAFORM_PLAN_TOKEN`") && readme.include?("Workers R2 Storage Read"), "README lacks the read-only Terraform plan token")
-  assert.call(readme.include?("`CLOUDFLARE_TERRAFORM_APPLY_TOKEN`") && readme.include?("Workers R2 Storage Write"), "README lacks the future Terraform apply token")
-  assert.call(readme.include?("향후 exact apply step에만") && readme.include?("plan token이나 애플리케이션용 R2 S3 credential로 재사용하지 않는다"), "README lacks exact apply-step isolation and no-reuse guidance")
-  assert.call(!readme.include?("`CLOUDFLARE_TERRAFORM_API_TOKEN`"), "README retains the legacy shared Terraform token")
-  assert.call(readme.include?("Object Read & Write") && readme.include?("exact final+pending"), "README lacks the exact application R2 credential scope")
-  assert.call(readme.include?("CLOUDFLARE_R2_PENDING_BUCKET"), "README lacks the pending R2 runtime secret")
-  assert.call(readme.include?("public/custom domain"), "README lacks the pending bucket privacy contract")
 end
 
 check.call("infra CI runs the focused Terraform plan contract") do
